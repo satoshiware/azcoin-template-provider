@@ -1,9 +1,10 @@
 # azcoin-template-provider
 
 Rust service that sits between `azcoind` and an SV2 mining pool.
-This is the **RPC-only phase** — it proves we can talk to `azcoind` over
-JSON-RPC and ingest live block templates before the SV2 Template Provider
-network layer is implemented.
+It polls `azcoind` for block templates over JSON-RPC and exposes a TCP
+listener where `pool_sv2` will eventually connect.  The current phase
+proves end-to-end connectivity on both sides — RPC ingestion is live,
+and the SV2 listener accepts connections with lifecycle logging.
 
 ## Project Structure
 
@@ -17,8 +18,9 @@ azcoin-template-provider/
 │   ├── config.rs     # TOML config loading & validation
 │   ├── rpc.rs        # JSON-RPC 1.0 client (reqwest + Basic auth)
 │   ├── template.rs   # RPC response types, AzcoinTemplate, change detection
-│   ├── poller.rs     # async polling loop (getblocktemplate on interval)
-│   └── health.rs     # startup connectivity & network-match check
+│   ├── poller.rs     # async polling loop (publishes via watch channel)
+│   ├── health.rs     # startup connectivity & network-match check
+│   └── tp_server.rs  # SV2 Template Provider stub (TCP listener)
 ├── testdata/
 │   └── getblocktemplate_regtest.json   # fixture for deserialization tests
 └── README.md
@@ -27,17 +29,19 @@ azcoin-template-provider/
 ## Architecture
 
 ```
-┌────────────┐  JSON-RPC   ┌─────────────────────────────────────┐
-│  azcoind   │◄────────────│  azcoin-template-provider           │
-│  (node)    │────────────►│                                     │
-└────────────┘             │  startup:                           │
+                           ┌─────────────────────────────────────┐
+┌────────────┐  JSON-RPC   │  azcoin-template-provider           │
+│  azcoind   │◄────────────│                                     │   TCP :8442
+│  (node)    │────────────►│  poller ──watch──► tp_server ◄──────── pool_sv2
+└────────────┘             │            channel   (stub)         │
+                           │                                     │
+                           │  startup:                           │
                            │    config.rs  → load TOML           │
                            │    health.rs  → getblockchaininfo   │
                            │                                     │
-                           │  loop:                              │
+                           │  concurrent tasks:                  │
                            │    poller.rs  → getblocktemplate    │
-                           │    template.rs → parse & compare    │
-                           │    tracing    → log changes         │
+                           │    tp_server  → accept connections  │
                            └─────────────────────────────────────┘
 ```
 
@@ -50,25 +54,55 @@ azcoin-template-provider/
 4. `template::AzcoinTemplate::describe_change()` compares against the
    previous template and returns a human-readable diff (or `None`).
 5. The result is logged via `tracing` at the appropriate level.
+6. The template is published through a `tokio::sync::watch` channel so
+   `tp_server` always has access to the latest template.
 
 ## Current Scope
 
 - Load configuration from a TOML file (`rpc_url`, `rpc_user`,
-  `rpc_password`, `poll_interval_ms`, `network`, `template_rules`).
+  `rpc_password`, `poll_interval_ms`, `network`, `template_rules`,
+  `tp_listen_address`, `authority_public_key`, `authority_secret_key`).
 - Connect to `azcoind` and verify connectivity via `getblockchaininfo`.
 - Poll `getblocktemplate` on a configurable interval.
 - Detect and log **template changes** (see below).
 - Expose helper RPC wrappers: `getblockchaininfo`, `getblocktemplate`,
   `submitblock`, `getbestblockhash`, `getblockheader`.
+- **SV2 TP stub**: Bind a TCP listener on `tp_listen_address`, accept
+  incoming connections, and log connect / disconnect / error lifecycle.
+- Share the latest polled template in-process via a `watch` channel
+  (ready for the TP server to consume in the next phase).
 
 ## Non-Goals (for this phase)
 
-- SV2 Template Provider network server.
+- SV2 Noise handshake / encrypted transport.
+- SV2 message framing (`SetupConnection`, `NewTemplate`, etc.).
+- Solved-block submission relay.
+- Translator proxy integration.
 - Block assembly or coinbase construction.
 - systemd / Docker packaging.
 - Metrics, Prometheus, or HTTP health endpoints.
 - Persistent storage.
 - Workspace-level Cargo changes.
+
+## SV2 Template Provider Stub
+
+The `tp_server` module (`src/tp_server.rs`) binds a TCP listener and
+logs the full connection lifecycle.  It is the connection point where
+`pool_sv2` will attach once SV2 message framing is layered on.
+
+**What works now:**
+- TCP bind on the configured `tp_listen_address` (default `0.0.0.0:8442`)
+- Logs each client connect, disconnect, and error with peer address
+- Holds a `watch::Receiver<Option<AzcoinTemplate>>` with the latest
+  template (not yet consumed — ready for next phase)
+- Authority keypair stored in config (not yet used for Noise)
+
+**What is explicitly NOT implemented:**
+- SV2 Noise protocol negotiation
+- SV2 binary message serialization/deserialization
+- `NewTemplate` / `SetNewPrevHash` message dispatch
+- `SubmitSolution` handling
+- Any interaction with `pool_sv2` beyond TCP accept
 
 ## AZCOIN-Specific Compatibility
 
@@ -150,6 +184,9 @@ are present.
 | `poll_interval_ms` | integer | yes | — | Polling interval in ms (minimum 100) |
 | `network` | string | yes | — | Expected chain name from `getblockchaininfo` |
 | `template_rules` | string[] | no | `[]` | BIP rules for `getblocktemplate` request |
+| `tp_listen_address` | string | no | `"0.0.0.0:8442"` | TCP address for the SV2 TP listener |
+| `authority_public_key` | string | no | `""` | Noise authority public key (hex) — stored, not yet used |
+| `authority_secret_key` | string | no | `""` | Noise authority secret key (hex) — stored, not yet used |
 
 See `config/azcoin-template-provider.toml.example` for a fully-commented
 reference file.
@@ -181,14 +218,17 @@ RUST_LOG=debug cargo run
 
 ```
 INFO  Loading configuration    path="config/azcoin-template-provider.toml"
-INFO  Configuration loaded     rpc_url="http://127.0.0.1:8332" network="regtest" poll_ms=1000
+INFO  Configuration loaded     rpc_url="http://127.0.0.1:8332" network="regtest" poll_ms=1000 tp_addr="0.0.0.0:8442"
 INFO  Connecting to azcoind    url="http://127.0.0.1:8332"
 INFO  RPC connection established  chain="regtest" blocks=200 headers=200 best_hash="7e4b..." ibd=false sync="100.0000%"
 INFO  Health check passed      network="regtest" template_rules=[]
+INFO  Starting SV2 Template Provider stub  tp_address="0.0.0.0:8442" authority_key_configured=false
+INFO  SV2 Template Provider stub listening  address=0.0.0.0:8442
 INFO  Starting template poller interval_ms=1000
 INFO  Initial template received  poll=1 height=201 prev_hash="7e4bac91..." tx_count=2 coinbase=5000037500
+INFO  SV2 client connected     peer=192.168.1.50:54321
 INFO  Template changed: new block: height 201 -> 202, prev_hash aabb0011..44556677
-INFO  Template changed: template updated (height 202): txs 2 -> 5, fees 37500 -> 112000, coinbase 5000037500 -> 5000112000
+INFO  SV2 client disconnected  peer=192.168.1.50:54321
 ```
 
 ### Troubleshooting

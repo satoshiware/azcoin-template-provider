@@ -3,6 +3,7 @@ mod health;
 mod poller;
 mod rpc;
 mod template;
+mod tp_server;
 
 use std::path::PathBuf;
 
@@ -40,6 +41,7 @@ async fn main() -> Result<()> {
         rpc_url  = %cfg.rpc_url,
         network  = %cfg.network,
         poll_ms  = cfg.poll_interval_ms,
+        tp_addr  = %cfg.tp_listen_address,
         "Configuration loaded"
     );
 
@@ -52,5 +54,16 @@ async fn main() -> Result<()> {
 
     health::check_rpc_connectivity(&client, &cfg).await?;
 
-    poller::run(&client, cfg.poll_interval_ms).await
+    let (template_tx, template_rx) = tokio::sync::watch::channel(None);
+
+    info!(
+        tp_address = %cfg.tp_listen_address,
+        authority_key_configured = !cfg.authority_public_key.is_empty(),
+        "Starting SV2 Template Provider stub"
+    );
+
+    tokio::select! {
+        res = poller::run(&client, cfg.poll_interval_ms, template_tx) => res,
+        res = tp_server::run(&cfg.tp_listen_address, template_rx) => res,
+    }
 }

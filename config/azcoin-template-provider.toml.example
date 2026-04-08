@@ -59,3 +59,17 @@ network = "regtest"
 # Example:
 #   template_rules = ["segwit"]
 template_rules = []
+
+# ----------------------------------------------------------------------------
+# SV2 Template Provider
+# ----------------------------------------------------------------------------
+
+# TCP address the SV2 Template Provider stub listens on.
+# pool_sv2 will connect here once SV2 message framing is implemented.
+tp_listen_address = "0.0.0.0:8442"
+
+# Noise protocol authority keypair (hex-encoded).
+# Required for authenticated SV2 connections in a future phase.
+# For the current stub these are stored but not yet consumed.
+authority_public_key = ""
+authority_secret_key = ""

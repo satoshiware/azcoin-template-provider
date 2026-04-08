@@ -1,9 +1,10 @@
 //! TOML configuration loading for the azcoin-template-provider service.
 //!
 //! The config file is the single source of truth for all runtime settings:
-//! RPC connection details, polling interval, target network, and optional
-//! template request rules.  See `config/azcoin-template-provider.toml.example`
-//! for a fully-commented reference.
+//! RPC connection details, polling interval, target network, template
+//! request rules, and TP listener address.
+//! See `config/azcoin-template-provider.toml.example` for a fully-commented
+//! reference.
 
 use std::path::Path;
 
@@ -12,9 +13,8 @@ use serde::Deserialize;
 
 /// Top-level configuration, deserialized from a TOML file.
 ///
-/// Every field except `template_rules` is required.  `template_rules` defaults
-/// to an empty list when omitted, which tells `getblocktemplate` to make no
-/// assumptions about soft-fork features (safe for AZCOIN).
+/// Required fields: `rpc_url`, `rpc_user`, `rpc_password`,
+/// `poll_interval_ms`, `network`.  All others have sensible defaults.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     /// JSON-RPC endpoint of `azcoind`, e.g. `http://127.0.0.1:8332`.
@@ -33,6 +33,23 @@ pub struct Config {
     /// Set to `["segwit"]` only if the chain has SegWit activated.
     #[serde(default)]
     pub template_rules: Vec<String>,
+    /// TCP address for the SV2 Template Provider listener,
+    /// e.g. `"0.0.0.0:8442"`.
+    #[serde(default = "default_tp_listen_address")]
+    pub tp_listen_address: String,
+    /// Noise authority public key (hex-encoded).  Will be used for SV2
+    /// Noise handshake authentication in a future phase.
+    #[serde(default)]
+    pub authority_public_key: String,
+    /// Noise authority secret key (hex-encoded).  Will be used for SV2
+    /// Noise handshake authentication in a future phase.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub authority_secret_key: String,
+}
+
+fn default_tp_listen_address() -> String {
+    "0.0.0.0:8442".to_string()
 }
 
 impl Config {

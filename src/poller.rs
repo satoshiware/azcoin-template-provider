@@ -5,12 +5,16 @@
 //! previous template.  Changes are logged at `INFO`; identical templates are
 //! logged at `DEBUG`.
 //!
+//! Each new template is also published through a [`tokio::sync::watch`]
+//! channel so the TP server can read the latest template at any time.
+//!
 //! The loop is resilient — a single failed RPC call logs an error and retries
 //! on the next tick without crashing the service.
 
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::sync::watch;
 use tokio::time;
 use tracing::{debug, error, info};
 
@@ -18,7 +22,14 @@ use crate::rpc::RpcClient;
 use crate::template::AzcoinTemplate;
 
 /// Run the polling loop until the process is terminated.
-pub async fn run(client: &RpcClient, poll_interval_ms: u64) -> Result<()> {
+///
+/// Every successfully-parsed template is sent through `template_tx` so that
+/// other tasks (e.g. the TP server) can observe the latest state.
+pub async fn run(
+    client: &RpcClient,
+    poll_interval_ms: u64,
+    template_tx: watch::Sender<Option<AzcoinTemplate>>,
+) -> Result<()> {
     let interval = Duration::from_millis(poll_interval_ms);
     let mut ticker = time::interval(interval);
     let mut previous: Option<AzcoinTemplate> = None;
@@ -71,6 +82,7 @@ pub async fn run(client: &RpcClient, poll_interval_ms: u64) -> Result<()> {
             },
         }
 
+        let _ = template_tx.send(Some(template.clone()));
         previous = Some(template);
     }
 }
