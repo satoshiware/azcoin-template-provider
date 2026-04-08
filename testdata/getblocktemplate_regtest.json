@@ -1,0 +1,46 @@
+{
+    "version": 536870912,
+    "rules": [],
+    "vbavailable": {},
+    "vbrequired": 0,
+    "previousblockhash": "7e4bac9158349c6370c2b32d046cc52149b0ea47cdd6e47e83d9e0f87e2456a1",
+    "transactions": [
+        {
+            "data": "0200000001aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd001122330000000000ffffffff0100f2052a0100000017a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba8700000000",
+            "txid": "a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d",
+            "hash": "a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d",
+            "depends": [],
+            "fee": 22500,
+            "sigops": 1,
+            "weight": 900
+        },
+        {
+            "data": "0200000001ffeeddcc00998877ffeeddcc00998877ffeeddcc00998877ffeeddcc009988770100000000ffffffff0200e1f505000000001976a914abcdefabcdefabcdefabcdefabcdefabcdefabcd88ac00ca9a3b000000001976a914111111111111111111111111111111111111111188ac00000000",
+            "txid": "c157e698a9352b03b7e2c5a9d93e5e7f9c3a8b4d6f1e0a2c4b5d6e7f8a9b0c1d",
+            "hash": "c157e698a9352b03b7e2c5a9d93e5e7f9c3a8b4d6f1e0a2c4b5d6e7f8a9b0c1d",
+            "depends": [],
+            "fee": 15000,
+            "sigops": 2,
+            "weight": 1200
+        }
+    ],
+    "coinbaseaux": {
+        "flags": ""
+    },
+    "coinbasevalue": 5000037500,
+    "longpollid": "7e4bac9158349c6370c2b32d046cc52149b0ea47cdd6e47e83d9e0f87e2456a1157",
+    "target": "7fffff0000000000000000000000000000000000000000000000000000000000",
+    "mintime": 1712500000,
+    "mutable": [
+        "time",
+        "transactions",
+        "prevblock"
+    ],
+    "noncerange": "00000000ffffffff",
+    "sigoplimit": 80000,
+    "sizelimit": 4000000,
+    "weightlimit": 4000000,
+    "curtime": 1712500100,
+    "bits": "207fffff",
+    "height": 201
+}

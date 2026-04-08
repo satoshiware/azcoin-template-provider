@@ -1,0 +1,61 @@
+# ============================================================================
+# azcoin-template-provider configuration
+# ============================================================================
+#
+# Copy this file to azcoin-template-provider.toml and adjust for your setup:
+#
+#   cp config/azcoin-template-provider.toml.example \
+#      config/azcoin-template-provider.toml
+#
+# The service reads this file at startup (override with --config <path>).
+
+# ----------------------------------------------------------------------------
+# RPC connection
+# ----------------------------------------------------------------------------
+
+# JSON-RPC endpoint of azcoind (include http:// or https://).
+# Default ports by network:
+#   mainnet  — 8332
+#   testnet  — 18332
+#   regtest  — 18443
+rpc_url = "http://127.0.0.1:8332"
+
+# RPC credentials (must match azcoind's -rpcuser / -rpcpassword or the
+# values in azcoin.conf).
+rpc_user = "azcoin"
+rpc_password = "azcoin"
+
+# ----------------------------------------------------------------------------
+# Polling
+# ----------------------------------------------------------------------------
+
+# How often to poll getblocktemplate, in milliseconds (minimum 100).
+# Lower values detect new blocks faster but increase RPC load on the node.
+poll_interval_ms = 1000
+
+# ----------------------------------------------------------------------------
+# Network
+# ----------------------------------------------------------------------------
+
+# Expected chain name, validated against the `chain` field in
+# getblockchaininfo at startup.  The service will refuse to start if
+# azcoind reports a different chain.
+#
+# AZCOIN may use custom chain names; any non-empty string is accepted.
+network = "regtest"
+
+# ----------------------------------------------------------------------------
+# Template request rules
+# ----------------------------------------------------------------------------
+
+# BIP feature rules to include in the getblocktemplate request object.
+#
+# Leave EMPTY (the default) for maximum AZCOIN compatibility — the node
+# will return a basic template without assuming any soft-fork features.
+#
+# Set to ["segwit"] ONLY if the chain has SegWit activated and you need
+# the witness commitment in templates.
+#
+# Example:
+#   template_rules = ["segwit"]
+template_rules = []
