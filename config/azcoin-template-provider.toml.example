@@ -64,12 +64,23 @@ template_rules = []
 # SV2 Template Provider
 # ----------------------------------------------------------------------------
 
-# TCP address the SV2 Template Provider stub listens on.
-# pool_sv2 will connect here once SV2 message framing is implemented.
+# TCP address the SV2 Template Provider (Noise) listener binds to.
+# pool_sv2 connects here to perform the Noise NX handshake.
 tp_listen_address = "0.0.0.0:8442"
 
-# Noise protocol authority keypair (hex-encoded).
-# Required for authenticated SV2 connections in a future phase.
-# For the current stub these are stored but not yet consumed.
-authority_public_key = ""
-authority_secret_key = ""
+# Noise protocol authority keypair (hex-encoded, 32 bytes / 64 hex chars).
+#
+# The responder uses this keypair to sign the handshake certificate that
+# proves its identity to the connecting pool.  The pool must be configured
+# with the matching authority_public_key.
+#
+# !! FOR TESTING / DEVELOPMENT ONLY !!
+# The keys below are the well-known secp256k1 generator-point keypair
+# (private key = 1).  NEVER use them in production.
+#
+# To generate a production keypair you can use the SRI `key-utils` crate
+# or any secp256k1 tool that outputs 32-byte x-only public keys.
+#
+# Leave BOTH empty to disable the Noise listener (poller-only mode).
+authority_public_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+authority_secret_key = "0000000000000000000000000000000000000000000000000000000000000001"

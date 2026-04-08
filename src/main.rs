@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(name = "azcoin-template-provider")]
@@ -56,14 +56,25 @@ async fn main() -> Result<()> {
 
     let (template_tx, template_rx) = tokio::sync::watch::channel(None);
 
-    info!(
-        tp_address = %cfg.tp_listen_address,
-        authority_key_configured = !cfg.authority_public_key.is_empty(),
-        "Starting SV2 Template Provider stub"
-    );
+    let keys_configured =
+        !cfg.authority_public_key.is_empty() && !cfg.authority_secret_key.is_empty();
 
-    tokio::select! {
-        res = poller::run(&client, cfg.poll_interval_ms, template_tx) => res,
-        res = tp_server::run(&cfg.tp_listen_address, template_rx) => res,
+    if keys_configured {
+        info!(
+            tp_address = %cfg.tp_listen_address,
+            "Starting SV2 Template Provider (Noise-authenticated)"
+        );
+        tokio::select! {
+            res = poller::run(&client, cfg.poll_interval_ms, template_tx) => res,
+            res = tp_server::run(
+                &cfg.tp_listen_address,
+                &cfg.authority_public_key,
+                &cfg.authority_secret_key,
+                template_rx,
+            ) => res,
+        }
+    } else {
+        warn!("authority keys not configured — SV2 TP listener disabled (poller-only mode)");
+        poller::run(&client, cfg.poll_interval_ms, template_tx).await
     }
 }

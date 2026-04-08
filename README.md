@@ -1,10 +1,11 @@
 # azcoin-template-provider
 
 Rust service that sits between `azcoind` and an SV2 mining pool.
-It polls `azcoind` for block templates over JSON-RPC and exposes a TCP
-listener where `pool_sv2` will eventually connect.  The current phase
-proves end-to-end connectivity on both sides — RPC ingestion is live,
-and the SV2 listener accepts connections with lifecycle logging.
+It polls `azcoind` for block templates over JSON-RPC and exposes a
+Noise-authenticated TCP listener where `pool_sv2` connects.  The current
+phase proves transport-level connectivity: the RPC poller ingests live
+templates, and the SV2 listener completes the Noise NX handshake with
+connecting pools, establishing an encrypted channel.
 
 ## Project Structure
 
@@ -20,7 +21,7 @@ azcoin-template-provider/
 │   ├── template.rs   # RPC response types, AzcoinTemplate, change detection
 │   ├── poller.rs     # async polling loop (publishes via watch channel)
 │   ├── health.rs     # startup connectivity & network-match check
-│   └── tp_server.rs  # SV2 Template Provider stub (TCP listener)
+│   └── tp_server.rs  # SV2 Template Provider (Noise NX handshake)
 ├── testdata/
 │   └── getblocktemplate_regtest.json   # fixture for deserialization tests
 └── README.md
@@ -31,9 +32,9 @@ azcoin-template-provider/
 ```
                            ┌─────────────────────────────────────┐
 ┌────────────┐  JSON-RPC   │  azcoin-template-provider           │
-│  azcoind   │◄────────────│                                     │   TCP :8442
+│  azcoind   │◄────────────│                                     │   Noise :8442
 │  (node)    │────────────►│  poller ──watch──► tp_server ◄──────── pool_sv2
-└────────────┘             │            channel   (stub)         │
+└────────────┘             │            channel  (Noise NX)      │
                            │                                     │
                            │  startup:                           │
                            │    config.rs  → load TOML           │
@@ -41,7 +42,7 @@ azcoin-template-provider/
                            │                                     │
                            │  concurrent tasks:                  │
                            │    poller.rs  → getblocktemplate    │
-                           │    tp_server  → accept connections  │
+                           │    tp_server  → Noise handshake    │
                            └─────────────────────────────────────┘
 ```
 
@@ -67,15 +68,17 @@ azcoin-template-provider/
 - Detect and log **template changes** (see below).
 - Expose helper RPC wrappers: `getblockchaininfo`, `getblocktemplate`,
   `submitblock`, `getbestblockhash`, `getblockheader`.
-- **SV2 TP stub**: Bind a TCP listener on `tp_listen_address`, accept
-  incoming connections, and log connect / disconnect / error lifecycle.
+- **SV2 TP (Noise)**: Bind a Noise-authenticated TCP listener on
+  `tp_listen_address`, perform a full Noise NX handshake with each
+  connecting pool, and keep the encrypted channel open.
 - Share the latest polled template in-process via a `watch` channel
   (ready for the TP server to consume in the next phase).
+- Graceful fallback to poller-only mode when authority keys are not
+  configured.
 
 ## Non-Goals (for this phase)
 
-- SV2 Noise handshake / encrypted transport.
-- SV2 message framing (`SetupConnection`, `NewTemplate`, etc.).
+- SV2 application-layer messages (`SetupConnection`, `NewTemplate`, etc.).
 - Solved-block submission relay.
 - Translator proxy integration.
 - Block assembly or coinbase construction.
@@ -84,25 +87,31 @@ azcoin-template-provider/
 - Persistent storage.
 - Workspace-level Cargo changes.
 
-## SV2 Template Provider Stub
+## SV2 Template Provider (Noise Transport)
 
-The `tp_server` module (`src/tp_server.rs`) binds a TCP listener and
-logs the full connection lifecycle.  It is the connection point where
-`pool_sv2` will attach once SV2 message framing is layered on.
+The `tp_server` module (`src/tp_server.rs`) implements the server-side
+(responder) Noise NX handshake using `noise_sv2::Responder`.
 
 **What works now:**
 - TCP bind on the configured `tp_listen_address` (default `0.0.0.0:8442`)
-- Logs each client connect, disconnect, and error with peer address
+- Full Noise NX handshake per connection:
+  1. Read initiator's 64-byte ElligatorSwift ephemeral key
+  2. Derive shared secrets, sign session certificate with authority key
+  3. Send 234-byte response (ephemeral key + encrypted static key + cert)
+  4. Encrypted transport established
+- Detailed lifecycle logging: listener startup, connect, handshake start,
+  handshake success, handshake failure reason, disconnect
 - Holds a `watch::Receiver<Option<AzcoinTemplate>>` with the latest
-  template (not yet consumed — ready for next phase)
-- Authority keypair stored in config (not yet used for Noise)
+  template (not yet consumed — ready for SV2 message layer)
+- Graceful fallback: if authority keys are empty, the Noise listener is
+  disabled and only the RPC poller runs
 
 **What is explicitly NOT implemented:**
-- SV2 Noise protocol negotiation
-- SV2 binary message serialization/deserialization
+- SV2 application-layer message framing / parsing
+- `SetupConnection` / `SetupConnection.Success` exchange
 - `NewTemplate` / `SetNewPrevHash` message dispatch
 - `SubmitSolution` handling
-- Any interaction with `pool_sv2` beyond TCP accept
+- Decryption of post-handshake SV2 frames (raw ciphertext is logged)
 
 ## AZCOIN-Specific Compatibility
 
@@ -184,9 +193,9 @@ are present.
 | `poll_interval_ms` | integer | yes | — | Polling interval in ms (minimum 100) |
 | `network` | string | yes | — | Expected chain name from `getblockchaininfo` |
 | `template_rules` | string[] | no | `[]` | BIP rules for `getblocktemplate` request |
-| `tp_listen_address` | string | no | `"0.0.0.0:8442"` | TCP address for the SV2 TP listener |
-| `authority_public_key` | string | no | `""` | Noise authority public key (hex) — stored, not yet used |
-| `authority_secret_key` | string | no | `""` | Noise authority secret key (hex) — stored, not yet used |
+| `tp_listen_address` | string | no | `"0.0.0.0:8442"` | TCP address for the SV2 Noise listener |
+| `authority_public_key` | string | no | `""` | Noise authority public key (64 hex chars). Empty = disable Noise. |
+| `authority_secret_key` | string | no | `""` | Noise authority secret key (64 hex chars). Empty = disable Noise. |
 
 See `config/azcoin-template-provider.toml.example` for a fully-commented
 reference file.
@@ -222,11 +231,14 @@ INFO  Configuration loaded     rpc_url="http://127.0.0.1:8332" network="regtest"
 INFO  Connecting to azcoind    url="http://127.0.0.1:8332"
 INFO  RPC connection established  chain="regtest" blocks=200 headers=200 best_hash="7e4b..." ibd=false sync="100.0000%"
 INFO  Health check passed      network="regtest" template_rules=[]
-INFO  Starting SV2 Template Provider stub  tp_address="0.0.0.0:8442" authority_key_configured=false
-INFO  SV2 Template Provider stub listening  address=0.0.0.0:8442
+INFO  Starting SV2 Template Provider (Noise-authenticated)  tp_address="0.0.0.0:8442"
+INFO  SV2 Template Provider listening (Noise-authenticated)  address=0.0.0.0:8442
 INFO  Starting template poller interval_ms=1000
 INFO  Initial template received  poll=1 height=201 prev_hash="7e4bac91..." tx_count=2 coinbase=5000037500
-INFO  SV2 client connected     peer=192.168.1.50:54321
+INFO  Incoming TCP connection  peer=192.168.1.50:54321
+INFO  Noise handshake: waiting for initiator ephemeral key  peer=192.168.1.50:54321
+INFO  Noise handshake: computing response  peer=192.168.1.50:54321
+INFO  Noise handshake completed — encrypted transport established  peer=192.168.1.50:54321
 INFO  Template changed: new block: height 201 -> 202, prev_hash aabb0011..44556677
 INFO  SV2 client disconnected  peer=192.168.1.50:54321
 ```
@@ -238,6 +250,8 @@ INFO  SV2 client disconnected  peer=192.168.1.50:54321
 | `HTTP request for RPC method 'getblockchaininfo' failed` | Node is down or `rpc_url` is wrong | Start `azcoind` and verify the URL/port |
 | `RPC 'getblockchaininfo' returned HTTP 401` | Bad credentials | Check `rpc_user` / `rpc_password` match the node config |
 | `network mismatch: config expects 'X' but azcoind reports 'Y'` | Wrong `network` value | Set `network` to the value `azcoind` actually reports |
+| `authority keypair is invalid` | Bad or mismatched hex keys | Generate a valid secp256k1 keypair (see config example) |
+| `authority keys not configured — SV2 TP listener disabled` | Keys are empty | Set `authority_public_key` / `authority_secret_key` in config |
 | `Node is still performing initial block download` | Node is syncing | Wait for sync to complete, or ignore the warning |
 | `RPC 'getblocktemplate' error [-9]` | Node is in IBD | `getblocktemplate` is unavailable during IBD — wait |
 | Repeated `Failed to get block template` | Intermittent RPC issues | The poller retries automatically each tick |
