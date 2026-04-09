@@ -313,6 +313,11 @@ async fn handle_connection(
     {
         Ok(()) => {
             let upd_rx = template_push_tx.subscribe();
+            info!(
+                peer = %peer,
+                receiver_count = template_push_tx.receiver_count(),
+                "SV2 live template push: subscribed Receiver for this session"
+            );
             let (read_half, write_half) = stream.into_split();
             drain_encrypted_frames_with_live_updates(
                 read_half,
@@ -545,10 +550,20 @@ async fn drain_encrypted_frames_with_live_updates(
     let peer_w = peer;
 
     tokio::spawn(async move {
+        info!(
+            peer = %peer_w,
+            "SV2 live template writer task started"
+        );
         let mut wh = write_half;
         loop {
             match upd_rx.recv().await {
                 Ok(payload) => {
+                    info!(
+                        peer = %peer_w,
+                        height = payload.template.height,
+                        prev_hash = %payload.template.previous_block_hash,
+                        "SV2 live template writer: received broadcast payload (recv Ok)"
+                    );
                     info!(
                         peer = %peer_w,
                         height = payload.template.height,
@@ -564,6 +579,11 @@ async fn drain_encrypted_frames_with_live_updates(
                             "SV2 live template push failed: {:#}",
                             e
                         );
+                        info!(
+                            peer = %peer_w,
+                            reason = "send_template_pair_error",
+                            "SV2 live template writer task: recv loop exiting"
+                        );
                         break;
                     }
                 }
@@ -574,9 +594,20 @@ async fn drain_encrypted_frames_with_live_updates(
                         "SV2 template update receiver lagged"
                     );
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    info!(
+                        peer = %peer_w,
+                        reason = "broadcast_closed",
+                        "SV2 live template writer task: recv loop exiting"
+                    );
+                    break;
+                }
             }
         }
+        info!(
+            peer = %peer_w,
+            "SV2 live template writer task ended"
+        );
     });
 
     info!(peer = %peer, "Session read loop with live template push (post-SetupConnection)");
@@ -599,10 +630,19 @@ async fn drain_encrypted_frames_with_live_updates(
             }
             Err(e) => {
                 if is_unexpected_eof(&e) {
-                    info!(peer = %peer, "SV2 client disconnected");
+                    info!(
+                        peer = %peer,
+                        reason = "unexpected_eof",
+                        "Session read loop exiting (SV2 client disconnected)"
+                    );
                     return Ok(());
                 }
-                warn!(peer = %peer, "SV2 read/decode error: {:#}", e);
+                warn!(
+                    peer = %peer,
+                    reason = "read_or_decode_error",
+                    "Session read loop exiting on error: {:#}",
+                    e
+                );
                 return Err(e);
             }
         }

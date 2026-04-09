@@ -96,9 +96,35 @@ pub async fn run(
                     "Template change detected (SV2 push fingerprint)"
                 );
             }
-            match template_push_tx.send(TemplateUpdatePayload {
+            let old_height = previous.as_ref().map(|p| p.height);
+            let receiver_count = template_push_tx.receiver_count();
+            info!(
+                poll = poll_count,
+                old_height = ?old_height,
+                new_height = template.height,
+                old_fingerprint = ?last_push_fp,
+                new_fingerprint = fp,
+                receiver_count = receiver_count,
+                "SV2 live broadcast: about to send (pre-send instrumentation)"
+            );
+            let send_result = template_push_tx.send(TemplateUpdatePayload {
                 template: template.clone(),
-            }) {
+            });
+            match &send_result {
+                Ok(n_receivers) => info!(
+                    poll = poll_count,
+                    receivers_notified = *n_receivers,
+                    result = "Ok",
+                    "SV2 live broadcast: send result"
+                ),
+                Err(e) => info!(
+                    poll = poll_count,
+                    result = "Err",
+                    error = ?e,
+                    "SV2 live broadcast: send result"
+                ),
+            }
+            match send_result {
                 Ok(n) => info!(
                     poll = poll_count,
                     receivers = n,
