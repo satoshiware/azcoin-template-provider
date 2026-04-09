@@ -7,6 +7,7 @@ description = "RPC adapter for azcoind block templates (SV2 Template Provider â€
 [dependencies]
 anyhow = "1"
 binary_sv2 = "5"
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 codec_sv2 = { version = "5", features = ["noise_sv2"] }
 common_messages_sv2 = "7"
@@ -16,6 +17,7 @@ noise_sv2 = "1"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+template_distribution_sv2 = "5"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"

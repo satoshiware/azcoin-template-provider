@@ -3,11 +3,13 @@
 Rust service that sits between `azcoind` and an SV2 mining pool.
 It polls `azcoind` for block templates over JSON-RPC and exposes a
 Noise-authenticated TCP listener where `pool_sv2` connects.  After the
-Noise NX handshake, the listener completes the **first** SV2 application
-exchange: it accepts `SetupConnection` as a **common message** (`extension_type = 0` per
-`pool_sv2`), checks the **payload** `protocol` field for Template Distribution, and replies with
-`SetupConnectionSuccess` (or `SetupConnectionError`).  **Only** that exchange is implemented at
-the application layer; template distribution (`NewTemplate`, etc.) is not.
+Noise NX handshake, the listener completes `SetupConnection` as a **common message**
+(`extension_type = 0`), checks `SetupConnection.protocol` for Template Distribution, and replies
+with `SetupConnectionSuccess` (or `SetupConnectionError`).  It then handles the **first** Template
+Distribution frame from the pool (`CoinbaseOutputConstraints`, `msg_type` **112 / 0x70**), and
+sends **`NewTemplate`** then **`SetNewPrevHash`** built from the latest cached
+`getblocktemplate` snapshot so the pool can leave its “waiting for initial template and prevhash”
+state.  Further SV2 messages are only decrypted and logged by header.
 
 ## Project Structure
 
@@ -23,7 +25,7 @@ azcoin-template-provider/
 │   ├── template.rs   # RPC response types, AzcoinTemplate, change detection
 │   ├── poller.rs     # async polling loop (publishes via watch channel)
 │   ├── health.rs     # startup connectivity & network-match check
-│   └── tp_server.rs  # SV2 TP: Noise + SetupConnection (codec_sv2 / common_messages_sv2)
+│   └── tp_server.rs  # SV2 TP: Noise + SetupConnection + minimal Template Distribution
 ├── testdata/
 │   └── getblocktemplate_regtest.json   # fixture for deserialization tests
 └── README.md
@@ -44,7 +46,7 @@ azcoin-template-provider/
                            │                                     │
                            │  concurrent tasks:                  │
                            │    poller.rs  → getblocktemplate    │
-                           │    tp_server  → Noise + SetupConnection │
+                           │    tp_server  → Noise + Setup + initial TD │
                            └─────────────────────────────────────┘
 ```
 
@@ -70,24 +72,29 @@ azcoin-template-provider/
 - Detect and log **template changes** (see below).
 - Expose helper RPC wrappers: `getblockchaininfo`, `getblocktemplate`,
   `submitblock`, `getbestblockhash`, `getblockheader`.
-- **SV2 TP (Noise + SetupConnection)**: Bind on `tp_listen_address`, run
-  Noise NX, then decrypt the first SV2 frame with `codec_sv2`.  Expect
-  **common-message framing** (`extension_type == 0`, `channel_msg == false`);
-  subprotocol is determined from the decoded `SetupConnection.protocol`
-  field (must be Template Distribution).  Negotiate protocol version **2**;
-  send `SetupConnectionSuccess` or `SetupConnectionError` (also on
-  extension type **0**).  Further encrypted frames are decrypted and logged
-  by header only; payloads are not handled.
+- **SV2 TP (Noise + SetupConnection + initial Template Distribution)**:
+  Bind on `tp_listen_address`, run Noise NX, then handle `SetupConnection`
+  as above (common messages on extension **0**, Template Distribution in
+  the payload, version **2**).  After `SetupConnectionSuccess`, read the next
+  encrypted frame: expect Template Distribution extension and
+  `CoinbaseOutputConstraints` (`MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS`,
+  decimal **112**).  Decode it, take the latest `AzcoinTemplate` from the
+  `watch` channel, and send **`NewTemplate`** (merkle path from template tx
+  `data` hex + placeholder coinbase leaf) then **`SetNewPrevHash`** (prev
+  hash, `nBits`, target, timestamp from the template).  Any further frames
+  are decrypted and logged by header only; their payloads are not handled.
 - Share the latest polled template in-process via a `watch` channel
-  (ready for template distribution in a later phase).
+  (used for the initial `NewTemplate` / `SetNewPrevHash` pair).
 - Graceful fallback to poller-only mode when authority keys are not
   configured.
 
 ## Non-Goals (for this phase)
 
-- SV2 messages beyond the first `SetupConnection` / success-or-error reply
-  (e.g. `NewTemplate`, `SetNewPrevHash`, `RequestTransactionData`).
-- Solved-block submission relay.
+- Ongoing Template Distribution after the first exchange: no push of
+  updated templates on every poll, no handling of `RequestTransactionData`,
+  no `SubmitSolution`, no re-announcement when the mempool changes.
+- Solved-block submission relay (RPC `submitblock` exists but is not wired
+  to SV2 submission flows).
 - Translator proxy integration.
 - Block assembly or coinbase construction.
 - systemd / Docker packaging.
@@ -95,12 +102,13 @@ azcoin-template-provider/
 - Persistent storage.
 - Workspace-level Cargo changes.
 
-## SV2 Template Provider (Noise + SetupConnection only)
+## SV2 Template Provider (Noise + SetupConnection + initial Template Distribution)
 
 The `tp_server` module (`src/tp_server.rs`) uses the same stack as the
 Stratum V2 reference crates: `noise_sv2` for the NX handshake,
-`codec_sv2` (with `noise_sv2` feature) for encrypted SV2 framing, and
-`common_messages_sv2` for `SetupConnection` / success / error messages.
+`codec_sv2` (with `noise_sv2` feature) for encrypted SV2 framing,
+`common_messages_sv2` for `SetupConnection` / success / error, and
+`template_distribution_sv2` for the first TD messages.
 
 **What works now:**
 - TCP bind on the configured `tp_listen_address` (default `0.0.0.0:8442`)
@@ -112,19 +120,29 @@ Stratum V2 reference crates: `noise_sv2` for the NX handshake,
 - Negotiate protocol version **2** only; reply with
   `SetupConnectionSuccess { used_version, flags: 0 }` or
   `SetupConnectionError` (`unsupported-protocol`, `protocol-version-mismatch`)
-- Log ciphertext size for the first frame, decoded message type,
-  `SetupConnection` display string, and when a success/error reply is sent
-- Post-setup: keep reading encrypted frames, decrypt with the same
+- **Inbound (Template Distribution):** decode the first post-success frame
+  as `CoinbaseOutputConstraints` when `msg_type == 112` (**0x70**,
+  `MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS`) and extension is Template
+  Distribution (`SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT`)
+- **Outbound (Template Distribution):** send **`NewTemplate`** then
+  **`SetNewPrevHash`** using the latest `AzcoinTemplate` from the poller
+  (`template_id` = `height.max(1)`; merkle path from GBT transaction `data`
+  hex; empty coinbase prefix/outputs placeholder; `future_template: true`)
+- Logging: inbound TD message type and decoded constraints; each outbound TD
+  `msg_type` / label; summary with template height and RPC prev-hash string
+- After that pair: keep reading encrypted frames, decrypt with the same
   session, log `msg_type` / extension / payload length (payload not parsed)
 - Graceful EOF handling on the idle read loop
-- Holds a `watch::Receiver<Option<AzcoinTemplate>>` (not yet used for
-  outbound templates)
 - Graceful fallback: empty authority keys → poller-only mode
 
 **What is explicitly NOT implemented:**
-- `NewTemplate`, `SetNewPrevHash`, `RequestTransactionData`, `SubmitSolution`
-- Parsing or responding to any SV2 message after the initial
-  `SetupConnection` exchange (beyond decrypt + header log)
+- `RequestTransactionData` / transaction data responses
+- `SubmitSolution` or any solved-block path over SV2
+- Pushing a **new** `NewTemplate` + `SetNewPrevHash` when the poller sees a
+  template change (only the initial pair after setup)
+- Applying `CoinbaseOutputConstraints` to coinbase layout (message is only
+  decoded and logged)
+- Parsing post-initial TD frames beyond header logging
 
 ## AZCOIN-Specific Compatibility
 
@@ -258,6 +276,12 @@ INFO  Frame-level validation passed (SetupConnection, extension_type=0, channel_
 INFO  Decoded SetupConnection body  peer=... setup="SetupConnection(protocol: 2, ..."
 INFO  Payload-level validation passed (SetupConnection.protocol = Template Distribution)  peer=...
 INFO  Response sent: SetupConnectionSuccess (common-message frame; template distribution negotiated in payload)  peer=... used_version=2 extension_type=0
+INFO  Waiting for first Template Distribution message after SetupConnectionSuccess  peer=...
+INFO  Inbound frame (post-SetupConnection)  peer=... msg_type=112 extension_type=2 ...
+INFO  Decoded inbound Template Distribution message  peer=... constant="MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS" ...
+INFO  Outbound Template Distribution message sent  peer=... label="NewTemplate" ...
+INFO  Outbound Template Distribution message sent  peer=... label="SetNewPrevHash" ...
+INFO  Initial template + prevhash sent to pool  peer=... template_id=... height=... prev_hash_rpc_hex="..."
 INFO  Session idle read loop (post-SetupConnection; payloads not decoded)  peer=...
 INFO  Template changed: new block: height 201 -> 202, prev_hash aabb0011..44556677
 INFO  SV2 client disconnected  peer=192.168.1.50:54321

@@ -1,25 +1,35 @@
-//! SV2 Template Provider — Noise transport + first application message (`SetupConnection`).
+//! SV2 Template Provider — Noise, `SetupConnection`, and minimal Template Distribution.
 //!
-//! After the Noise NX handshake, decrypts the first SV2 frame with [`codec_sv2::StandardNoiseDecoder`].
-//! `SetupConnection` uses **common-message framing** (`extension_type == 0`); the negotiated
-//! subprotocol is read from [`SetupConnection::protocol`] (must be Template Distribution for this
-//! role).  Replies with [`SetupConnectionSuccess`] or [`SetupConnectionError`].  Further encrypted
-//! frames are read and logged at header level only (payload not decoded).
+//! After the Noise NX handshake: common-message `SetupConnection` / success or error, then (when the
+//! pool sends [`CoinbaseOutputConstraints`]) outbound [`NewTemplate`] + [`SetNewPrevHash`] built
+//! from the latest [`AzcoinTemplate`] on the watch channel.  Further frames are decrypted and logged
+//! by header only.
+//!
+//! [`CoinbaseOutputConstraints`]: template_distribution_sv2::CoinbaseOutputConstraints
+//! [`NewTemplate`]: template_distribution_sv2::NewTemplate
+//! [`SetNewPrevHash`]: template_distribution_sv2::SetNewPrevHash
+//! [`AzcoinTemplate`]: crate::template::AzcoinTemplate
 
+use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use binary_sv2::{from_bytes, Str0255};
+use binary_sv2::{from_bytes, GetSize, Seq0255, Serialize, Str0255, U256};
 use codec_sv2::{Error as CodecError, NoiseEncoder, StandardNoiseDecoder};
 use common_messages_sv2::{
     Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
     MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
-    MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+    MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT,
 };
 use framing_sv2::header::Header;
 use framing_sv2::framing::{Frame, Sv2Frame};
 use noise_sv2::Responder;
+use template_distribution_sv2::{
+    CoinbaseOutputConstraints, NewTemplate, SetNewPrevHash,
+    MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS, MESSAGE_TYPE_NEW_TEMPLATE,
+    MESSAGE_TYPE_SET_NEW_PREV_HASH,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -84,7 +94,7 @@ async fn handle_connection(
     peer: SocketAddr,
     authority_pub: &[u8; 32],
     authority_sec: &[u8; 32],
-    _template_rx: watch::Receiver<Option<AzcoinTemplate>>,
+    mut template_rx: watch::Receiver<Option<AzcoinTemplate>>,
 ) -> Result<()> {
     // ---- Noise NX handshake (responder side) --------------------------------
 
@@ -287,7 +297,196 @@ async fn handle_connection(
         "Response sent: SetupConnectionSuccess (common-message frame; template distribution negotiated in payload)"
     );
 
+    match run_template_distribution_init(
+        &mut stream,
+        &mut decoder,
+        &mut transport_state,
+        peer,
+        &mut template_rx,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(e) => warn!(
+            peer = %peer,
+            "Template distribution init failed (pool may retry or disconnect): {:#}",
+            e
+        ),
+    }
+
     drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await
+}
+
+/// After `SetupConnectionSuccess`, read [`CoinbaseOutputConstraints`] (`msg_type` **0x70 / 112**)
+/// and reply with [`NewTemplate`] then [`SetNewPrevHash`] from the latest polled template.
+async fn run_template_distribution_init(
+    stream: &mut TcpStream,
+    decoder: &mut StandardNoiseDecoder<SetupConnection<'_>>,
+    transport_state: &mut codec_sv2::State,
+    peer: SocketAddr,
+    template_rx: &mut watch::Receiver<Option<AzcoinTemplate>>,
+) -> Result<()> {
+    info!(
+        peer = %peer,
+        "Waiting for first Template Distribution message after SetupConnectionSuccess"
+    );
+
+    let (header, mut payload, cipher_len) =
+        read_encrypted_sv2_frame(stream, decoder, transport_state, peer).await?;
+
+    let ext = header.ext_type_without_channel_msg();
+    let mt = header.msg_type();
+    info!(
+        peer = %peer,
+        cipher_bytes = cipher_len,
+        msg_type = mt,
+        extension_type = ext,
+        payload_len = payload.len(),
+        "Inbound frame (post-SetupConnection)"
+    );
+
+    anyhow::ensure!(
+        ext == SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT as u16,
+        "expected Template Distribution extension type {} (got {})",
+        SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT,
+        ext
+    );
+
+    anyhow::ensure!(
+        mt == MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS,
+        "expected first TD message CoinbaseOutputConstraints (MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS = 0x70 = 112), got {}",
+        mt
+    );
+
+    let constraints: CoinbaseOutputConstraints = from_bytes(&mut payload)
+        .map_err(|e| anyhow!("decode CoinbaseOutputConstraints: {:?}", e))?;
+
+    info!(
+        peer = %peer,
+        inbound = %constraints,
+        msg_type = mt,
+        msg_type_decimal = mt as u16,
+        msg_type_hex = "0x70",
+        constant = "MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS",
+        "Decoded inbound Template Distribution message"
+    );
+
+    let tmpl = wait_for_template(template_rx).await?;
+    let template_id = tmpl.height.max(1);
+    let prev = crate::template::prev_hash_bytes_from_rpc_hex(&tmpl.previous_block_hash)?;
+    let n_bits = crate::template::n_bits_from_bits_hex(&tmpl.bits)?;
+    let target = crate::template::target_bytes_from_hex(&tmpl.target)?;
+
+    let merkle_flat = tmpl.sv2_merkle_path_hashes()?;
+    let merkle_path: Seq0255<U256<'static>> = merkle_flat
+        .iter()
+        .map(|b| U256::from(*b))
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|e| anyhow!("merkle Seq0255: {:?}", e))?;
+
+    let coinbase_prefix: binary_sv2::B0255<'static> = Vec::new()
+        .try_into()
+        .map_err(|e| anyhow!("B0255 empty: {:?}", e))?;
+    let coinbase_tx_outputs: binary_sv2::B064K<'static> = Vec::new()
+        .try_into()
+        .map_err(|e| anyhow!("B064K empty: {:?}", e))?;
+
+    let new_t = NewTemplate {
+        template_id,
+        future_template: true,
+        version: tmpl.version,
+        coinbase_tx_version: 2,
+        coinbase_prefix,
+        coinbase_tx_input_sequence: 0xffff_ffff,
+        coinbase_tx_value_remaining: tmpl.coinbase_value,
+        coinbase_tx_outputs_count: 0,
+        coinbase_tx_outputs,
+        coinbase_tx_locktime: 0,
+        merkle_path,
+    };
+
+    send_noise_td(
+        stream,
+        transport_state,
+        new_t,
+        MESSAGE_TYPE_NEW_TEMPLATE,
+        peer,
+        "NewTemplate",
+    )
+    .await?;
+
+    let set_prev = SetNewPrevHash {
+        template_id,
+        prev_hash: U256::from(prev),
+        header_timestamp: tmpl.curtime as u32,
+        n_bits,
+        target: U256::from(target),
+    };
+
+    send_noise_td(
+        stream,
+        transport_state,
+        set_prev,
+        MESSAGE_TYPE_SET_NEW_PREV_HASH,
+        peer,
+        "SetNewPrevHash",
+    )
+    .await?;
+
+    info!(
+        peer = %peer,
+        template_id,
+        height = tmpl.height,
+        prev_hash_rpc_hex = %tmpl.previous_block_hash,
+        outbound = "NewTemplate then SetNewPrevHash",
+        "Initial template + prevhash sent to pool"
+    );
+
+    Ok(())
+}
+
+async fn wait_for_template(rx: &mut watch::Receiver<Option<AzcoinTemplate>>) -> Result<AzcoinTemplate> {
+    loop {
+        if let Some(t) = rx.borrow().clone() {
+            return Ok(t);
+        }
+        rx.changed()
+            .await
+            .map_err(|_| anyhow!("template watch channel closed before first template"))?;
+    }
+}
+
+async fn send_noise_td<T>(
+    stream: &mut TcpStream,
+    transport_state: &mut codec_sv2::State,
+    payload: T,
+    msg_type: u8,
+    peer: SocketAddr,
+    label: &'static str,
+) -> Result<()>
+where
+    T: Serialize + GetSize,
+{
+    let ext = SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT as u16;
+    let frame = Sv2Frame::from_message(payload, msg_type, ext, false)
+        .ok_or_else(|| anyhow!("Sv2Frame::from_message failed ({label})"))?;
+    let mut enc = NoiseEncoder::<T>::new();
+    let bytes = enc
+        .encode(Frame::Sv2(frame), transport_state)
+        .map_err(|e| anyhow!("Noise encode {label}: {:?}", e))?;
+    stream
+        .write_all(bytes.as_ref())
+        .await
+        .with_context(|| format!("write {label}"))?;
+    stream.flush().await?;
+    info!(
+        peer = %peer,
+        msg_type,
+        label,
+        "Outbound Template Distribution message sent"
+    );
+    Ok(())
 }
 
 /// Read one Noise-encrypted SV2 frame; copies payload into an owned buffer for decoding.

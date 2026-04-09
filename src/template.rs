@@ -14,6 +14,12 @@
 
 #![allow(dead_code)]
 
+use anyhow::{Context, Result};
+use bitcoin::blockdata::block::TxMerkleNode;
+use bitcoin::consensus::deserialize;
+use bitcoin::consensus::Encodable;
+use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::Transaction;
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -155,6 +161,8 @@ pub struct TemplateTx {
     pub fee: u64,
     pub weight: u64,
     pub sigops: u64,
+    /// Full transaction hex from `getblocktemplate` (`data` field), for SV2 merkle paths.
+    pub data: String,
 }
 
 impl AzcoinTemplate {
@@ -168,6 +176,7 @@ impl AzcoinTemplate {
                 fee: tx.fee,
                 weight: tx.weight,
                 sigops: tx.sigops,
+                data: tx.data.clone(),
             })
             .collect();
 
@@ -231,6 +240,92 @@ impl AzcoinTemplate {
 
         None
     }
+
+    /// Merkle path for SV2 `NewTemplate` (coinbase at index 0, non-coinbase leaves from
+    /// `transactions[].data` hex).
+    pub fn sv2_merkle_path_hashes(&self) -> Result<Vec<[u8; 32]>> {
+        let hexes: Vec<&str> = self.transactions.iter().map(|t| t.data.as_str()).collect();
+        merkle_path_from_template_tx_hexes(&hexes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SV2 / Bitcoin helpers (Template Distribution `NewTemplate` / `SetNewPrevHash`)
+// ---------------------------------------------------------------------------
+
+/// Tx merkle leaf hash (legacy txid) for a `getblocktemplate` transaction `data` hex.
+pub fn tx_merkle_leaf_from_hex(tx_hex: &str) -> Result<[u8; 32]> {
+    let raw = hex::decode(tx_hex.trim()).context("decode transaction hex")?;
+    match deserialize::<Transaction>(&raw) {
+        Ok(tx) => Ok(tx.compute_txid().to_byte_array()),
+        Err(_) => Ok(sha256d::Hash::hash(&raw).to_byte_array()),
+    }
+}
+
+fn pair_merkle(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    let mut eng = TxMerkleNode::engine();
+    TxMerkleNode::from_byte_array(a)
+        .consensus_encode(&mut eng)
+        .expect("in-memory encode");
+    TxMerkleNode::from_byte_array(b)
+        .consensus_encode(&mut eng)
+        .expect("in-memory encode");
+    TxMerkleNode::from_engine(eng).to_byte_array()
+}
+
+/// Branch hashes for a block where the coinbase is the leftmost leaf and `tx_leaves` are the
+/// remaining transaction txids (post-coinbase order), matching Bitcoin’s merkle tree.
+pub fn merkle_path_for_coinbase_prefix(tx_leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let mut leaves: Vec<[u8; 32]> = std::iter::once([0u8; 32])
+        .chain(tx_leaves.iter().copied())
+        .collect();
+    let mut idx = 0usize;
+    let mut branch = Vec::new();
+    while leaves.len() > 1 {
+        if leaves.len() % 2 == 1 {
+            leaves.push(*leaves.last().unwrap());
+        }
+        branch.push(leaves[idx ^ 1]);
+        let mut next = Vec::with_capacity(leaves.len() / 2);
+        for i in (0..leaves.len()).step_by(2) {
+            next.push(pair_merkle(leaves[i], leaves[i + 1]));
+        }
+        idx /= 2;
+        leaves = next;
+    }
+    branch
+}
+
+pub fn merkle_path_from_template_tx_hexes(tx_hexes: &[&str]) -> Result<Vec<[u8; 32]>> {
+    let mut leaves = Vec::with_capacity(tx_hexes.len());
+    for h in tx_hexes {
+        if h.is_empty() {
+            anyhow::bail!("transaction data hex is empty (cannot build merkle path)");
+        }
+        leaves.push(tx_merkle_leaf_from_hex(h)?);
+    }
+    Ok(merkle_path_for_coinbase_prefix(&leaves))
+}
+
+/// `nBits` field as a `u32` (same interpretation as Bitcoin header / `getblocktemplate` hex string).
+pub fn n_bits_from_bits_hex(bits: &str) -> Result<u32> {
+    let s = bits.trim().trim_start_matches("0x");
+    u32::from_str_radix(s, 16).context("parse bits hex")
+}
+
+/// 32-byte block target from `getblocktemplate` `target` hex (64 hex chars).
+pub fn target_bytes_from_hex(target: &str) -> Result<[u8; 32]> {
+    let v = hex::decode(target.trim()).context("decode target hex")?;
+    anyhow::ensure!(v.len() == 32, "target must be 32 bytes, got {}", v.len());
+    Ok(v.try_into().expect("length checked"))
+}
+
+/// Previous block hash bytes in **block header** order from RPC hex (reverse of JSON byte order).
+pub fn prev_hash_bytes_from_rpc_hex(prev: &str) -> Result<[u8; 32]> {
+    let mut v = hex::decode(prev.trim()).context("decode previousblockhash hex")?;
+    anyhow::ensure!(v.len() == 32, "prev hash must be 32 bytes, got {}", v.len());
+    v.reverse();
+    Ok(v.try_into().expect("length checked"))
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +443,7 @@ mod tests {
                     fee: 10_000,
                     weight: 500,
                     sigops: 1,
+                    data: String::new(),
                 })
                 .collect(),
         }
