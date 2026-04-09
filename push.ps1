@@ -1,9 +1,9 @@
 git status
 git add -A
-git commit -m "Finalizing the first version of azcoin-template-provider fixed 2 mismatches with the reference implementation v0.1.0"   
-git tag v0.1.0
+git commit -m "Adding logs and updating to v0.1.4"   
+git tag v0.1.4
 git push origin main
-git push origin v0.1.0
+git push origin v0.1.4
 
 $SHA = (git rev-parse --short HEAD).Trim()
 

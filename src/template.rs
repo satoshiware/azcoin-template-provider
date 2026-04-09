@@ -14,11 +14,14 @@
 
 #![allow(dead_code)]
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as StdHash, Hasher};
+
 use anyhow::{Context, Result};
 use bitcoin::blockdata::block::TxMerkleNode;
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::Encodable;
-use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::hashes::{sha256d, Hash as BtcHash};
 use bitcoin::Transaction;
 use serde::Deserialize;
 
@@ -128,6 +131,30 @@ pub struct RpcBlockHeader {
 // ---------------------------------------------------------------------------
 // Normalized internal representation — decoupled from the wire format.
 // ---------------------------------------------------------------------------
+
+/// Latest template snapshot for live SV2 pushes (built from polled [`AzcoinTemplate`]).
+#[derive(Clone, Debug)]
+pub struct TemplateUpdatePayload {
+    pub template: AzcoinTemplate,
+}
+
+/// Fingerprint for deduplicating SV2 template pushes across polls.
+///
+/// Covers tip identity, difficulty (`bits` / `target`), coinbase value, and non-coinbase tx
+/// order/ids. **`curtime` is intentionally omitted** — it advances almost every poll and does not
+/// represent a new block-building job for the pool.
+pub fn template_push_fingerprint(t: &AzcoinTemplate) -> u64 {
+    let mut h = DefaultHasher::new();
+    StdHash::hash(&t.previous_block_hash, &mut h);
+    StdHash::hash(&t.height, &mut h);
+    StdHash::hash(&t.bits, &mut h);
+    StdHash::hash(&t.target, &mut h);
+    StdHash::hash(&t.coinbase_value, &mut h);
+    for tx in &t.transactions {
+        StdHash::hash(&tx.txid, &mut h);
+    }
+    h.finish()
+}
 
 /// Chain-agnostic snapshot of a block template.
 ///
@@ -258,7 +285,7 @@ pub fn tx_merkle_leaf_from_hex(tx_hex: &str) -> Result<[u8; 32]> {
     let raw = hex::decode(tx_hex.trim()).context("decode transaction hex")?;
     match deserialize::<Transaction>(&raw) {
         Ok(tx) => Ok(tx.compute_txid().to_byte_array()),
-        Err(_) => Ok(sha256d::Hash::hash(&raw).to_byte_array()),
+        Err(_) => Ok(<sha256d::Hash as BtcHash>::hash(raw.as_slice()).to_byte_array()),
     }
 }
 

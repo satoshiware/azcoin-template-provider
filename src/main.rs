@@ -55,6 +55,8 @@ async fn main() -> Result<()> {
     health::check_rpc_connectivity(&client, &cfg).await?;
 
     let (template_tx, template_rx) = tokio::sync::watch::channel(None);
+    let (template_push_tx, _) =
+        tokio::sync::broadcast::channel::<crate::template::TemplateUpdatePayload>(64);
 
     let keys_configured =
         !cfg.authority_public_key.is_empty() && !cfg.authority_secret_key.is_empty();
@@ -64,17 +66,25 @@ async fn main() -> Result<()> {
             tp_address = %cfg.tp_listen_address,
             "Starting SV2 Template Provider (Noise-authenticated)"
         );
+        let push = template_push_tx.clone();
         tokio::select! {
-            res = poller::run(&client, cfg.poll_interval_ms, template_tx) => res,
+            res = poller::run(&client, cfg.poll_interval_ms, template_tx, push) => res,
             res = tp_server::run(
                 &cfg.tp_listen_address,
                 &cfg.authority_public_key,
                 &cfg.authority_secret_key,
                 template_rx,
+                template_push_tx,
             ) => res,
         }
     } else {
         warn!("authority keys not configured — SV2 TP listener disabled (poller-only mode)");
-        poller::run(&client, cfg.poll_interval_ms, template_tx).await
+        poller::run(
+            &client,
+            cfg.poll_interval_ms,
+            template_tx,
+            template_push_tx,
+        )
+        .await
     }
 }

@@ -30,12 +30,14 @@ use template_distribution_sv2::{
     MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS, MESSAGE_TYPE_NEW_TEMPLATE,
     MESSAGE_TYPE_SET_NEW_PREV_HASH,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{debug, error, info, warn};
 
-use crate::template::AzcoinTemplate;
+use crate::template::{AzcoinTemplate, TemplateUpdatePayload};
 
 /// Certificate validity period used when constructing the Noise responder.
 const CERT_VALIDITY: Duration = Duration::from_secs(86400);
@@ -56,6 +58,7 @@ pub async fn run(
     authority_public_key_hex: &str,
     authority_secret_key_hex: &str,
     template_rx: watch::Receiver<Option<AzcoinTemplate>>,
+    template_push_tx: broadcast::Sender<TemplateUpdatePayload>,
 ) -> Result<()> {
     let pub_key = decode_key(authority_public_key_hex, "authority_public_key")?;
     let sec_key = decode_key(authority_secret_key_hex, "authority_secret_key")?;
@@ -75,8 +78,9 @@ pub async fn run(
                 let pk = pub_key;
                 let sk = sec_key;
                 let rx = template_rx.clone();
+                let push = template_push_tx.clone();
                 tokio::spawn(async move {
-                    match handle_connection(stream, peer, &pk, &sk, rx).await {
+                    match handle_connection(stream, peer, &pk, &sk, rx, push).await {
                         Ok(()) => {}
                         Err(e) => warn!(peer = %peer, "SV2 session ended: {:#}", e),
                     }
@@ -95,6 +99,7 @@ async fn handle_connection(
     authority_pub: &[u8; 32],
     authority_sec: &[u8; 32],
     mut template_rx: watch::Receiver<Option<AzcoinTemplate>>,
+    template_push_tx: broadcast::Sender<TemplateUpdatePayload>,
 ) -> Result<()> {
     // ---- Noise NX handshake (responder side) --------------------------------
 
@@ -306,15 +311,28 @@ async fn handle_connection(
     )
     .await
     {
-        Ok(()) => {}
-        Err(e) => warn!(
-            peer = %peer,
-            "Template distribution init failed (pool may retry or disconnect): {:#}",
-            e
-        ),
+        Ok(()) => {
+            let upd_rx = template_push_tx.subscribe();
+            let (read_half, write_half) = stream.into_split();
+            drain_encrypted_frames_with_live_updates(
+                read_half,
+                write_half,
+                &mut decoder,
+                transport_state,
+                peer,
+                upd_rx,
+            )
+            .await
+        }
+        Err(e) => {
+            warn!(
+                peer = %peer,
+                "Template distribution init failed (pool may retry or disconnect): {:#}",
+                e
+            );
+            drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await
+        }
     }
-
-    drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await
 }
 
 /// After `SetupConnectionSuccess`, read [`CoinbaseOutputConstraints`] (`msg_type` **0x70 / 112**)
@@ -385,6 +403,38 @@ async fn run_template_distribution_init(
     );
 
     let tmpl = wait_for_template(template_rx).await?;
+    send_template_pair(stream, transport_state, &tmpl, peer).await?;
+
+    info!(
+        peer = %peer,
+        template_id = tmpl.height.max(1),
+        height = tmpl.height,
+        prev_hash_rpc_hex = %tmpl.previous_block_hash,
+        outbound = "NewTemplate then SetNewPrevHash",
+        "Initial template + prevhash sent to pool"
+    );
+
+    Ok(())
+}
+
+async fn wait_for_template(rx: &mut watch::Receiver<Option<AzcoinTemplate>>) -> Result<AzcoinTemplate> {
+    loop {
+        if let Some(t) = rx.borrow().clone() {
+            return Ok(t);
+        }
+        rx.changed()
+            .await
+            .map_err(|_| anyhow!("template watch channel closed before first template"))?;
+    }
+}
+
+/// Build and send `NewTemplate` then `SetNewPrevHash` for `tmpl` (ordering preserved).
+async fn send_template_pair<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    transport_state: &mut codec_sv2::State,
+    tmpl: &AzcoinTemplate,
+    peer: SocketAddr,
+) -> Result<()> {
     let template_id = tmpl.height.max(1);
     let prev = crate::template::prev_hash_bytes_from_rpc_hex(&tmpl.previous_block_hash)?;
     let n_bits = crate::template::n_bits_from_bits_hex(&tmpl.bits)?;
@@ -419,13 +469,13 @@ async fn run_template_distribution_init(
         merkle_path,
     };
 
-    send_noise_td(
+    write_td_frame(
         stream,
         transport_state,
         new_t,
         MESSAGE_TYPE_NEW_TEMPLATE,
         peer,
-        "NewTemplate",
+        "NewTemplate sent",
     )
     .await?;
 
@@ -437,76 +487,131 @@ async fn run_template_distribution_init(
         target: U256::from(target),
     };
 
-    send_noise_td(
+    write_td_frame(
         stream,
         transport_state,
         set_prev,
         MESSAGE_TYPE_SET_NEW_PREV_HASH,
         peer,
-        "SetNewPrevHash",
+        "SetNewPrevHash sent",
     )
     .await?;
-
-    info!(
-        peer = %peer,
-        template_id,
-        height = tmpl.height,
-        prev_hash_rpc_hex = %tmpl.previous_block_hash,
-        outbound = "NewTemplate then SetNewPrevHash",
-        "Initial template + prevhash sent to pool"
-    );
 
     Ok(())
 }
 
-async fn wait_for_template(rx: &mut watch::Receiver<Option<AzcoinTemplate>>) -> Result<AzcoinTemplate> {
-    loop {
-        if let Some(t) = rx.borrow().clone() {
-            return Ok(t);
-        }
-        rx.changed()
-            .await
-            .map_err(|_| anyhow!("template watch channel closed before first template"))?;
-    }
-}
-
-async fn send_noise_td<T>(
-    stream: &mut TcpStream,
+async fn write_td_frame<T, W: AsyncWrite + Unpin>(
+    stream: &mut W,
     transport_state: &mut codec_sv2::State,
     payload: T,
     msg_type: u8,
     peer: SocketAddr,
-    label: &'static str,
+    log_message: &'static str,
 ) -> Result<()>
 where
     T: Serialize + GetSize,
 {
-    // Same common extension as inbound TD frames (`pool_sv2` / protocol classifier).
     let ext = COMMON_MSG_EXTENSION_TYPE;
     let frame = Sv2Frame::from_message(payload, msg_type, ext, false)
-        .ok_or_else(|| anyhow!("Sv2Frame::from_message failed ({label})"))?;
+        .ok_or_else(|| anyhow!("Sv2Frame::from_message failed ({log_message})"))?;
     let mut enc = NoiseEncoder::<T>::new();
     let bytes = enc
         .encode(Frame::Sv2(frame), transport_state)
-        .map_err(|e| anyhow!("Noise encode {label}: {:?}", e))?;
+        .map_err(|e| anyhow!("Noise encode {log_message}: {:?}", e))?;
     stream
         .write_all(bytes.as_ref())
         .await
-        .with_context(|| format!("write {label}"))?;
+        .with_context(|| format!("write {log_message}"))?;
     stream.flush().await?;
     info!(
         peer = %peer,
         msg_type,
         extension_type = ext,
-        label,
-        "Outbound Template Distribution message sent"
+        "{}", log_message
     );
     Ok(())
 }
 
+async fn drain_encrypted_frames_with_live_updates(
+    mut read_half: tokio::net::tcp::OwnedReadHalf,
+    write_half: tokio::net::tcp::OwnedWriteHalf,
+    decoder: &mut StandardNoiseDecoder<SetupConnection<'_>>,
+    transport_state: codec_sv2::State,
+    peer: SocketAddr,
+    mut upd_rx: broadcast::Receiver<TemplateUpdatePayload>,
+) -> Result<()> {
+    let state = Arc::new(Mutex::new(transport_state));
+    let w_state = Arc::clone(&state);
+    let peer_w = peer;
+
+    tokio::spawn(async move {
+        let mut wh = write_half;
+        loop {
+            match upd_rx.recv().await {
+                Ok(payload) => {
+                    info!(
+                        peer = %peer_w,
+                        height = payload.template.height,
+                        prev_hash = %payload.template.previous_block_hash,
+                        "Template update dequeued for SV2 session"
+                    );
+                    let mut g = w_state.lock().await;
+                    if let Err(e) =
+                        send_template_pair(&mut wh, &mut *g, &payload.template, peer_w).await
+                    {
+                        warn!(
+                            peer = %peer_w,
+                            "SV2 live template push failed: {:#}",
+                            e
+                        );
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        peer = %peer_w,
+                        skipped,
+                        "SV2 template update receiver lagged"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    info!(peer = %peer, "Session read loop with live template push (post-SetupConnection)");
+
+    loop {
+        let frame_result = {
+            let mut g = state.lock().await;
+            read_encrypted_sv2_frame(&mut read_half, decoder, &mut *g, peer).await
+        };
+        match frame_result {
+            Ok((h, payload, cipher_len)) => {
+                info!(
+                    peer = %peer,
+                    cipher_bytes = cipher_len,
+                    msg_type = h.msg_type(),
+                    extension_type = h.ext_type(),
+                    payload_len = payload.len(),
+                    "Received encrypted SV2 frame (not handled at application layer)"
+                );
+            }
+            Err(e) => {
+                if is_unexpected_eof(&e) {
+                    info!(peer = %peer, "SV2 client disconnected");
+                    return Ok(());
+                }
+                warn!(peer = %peer, "SV2 read/decode error: {:#}", e);
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Read one Noise-encrypted SV2 frame; copies payload into an owned buffer for decoding.
-async fn read_encrypted_sv2_frame(
-    stream: &mut TcpStream,
+async fn read_encrypted_sv2_frame<R: AsyncRead + Unpin>(
+    stream: &mut R,
     decoder: &mut StandardNoiseDecoder<SetupConnection<'_>>,
     state: &mut codec_sv2::State,
     peer: SocketAddr,

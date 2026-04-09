@@ -14,12 +14,12 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::time;
 use tracing::{debug, error, info};
 
 use crate::rpc::RpcClient;
-use crate::template::AzcoinTemplate;
+use crate::template::{template_push_fingerprint, AzcoinTemplate, TemplateUpdatePayload};
 
 /// Run the polling loop until the process is terminated.
 ///
@@ -29,10 +29,12 @@ pub async fn run(
     client: &RpcClient,
     poll_interval_ms: u64,
     template_tx: watch::Sender<Option<AzcoinTemplate>>,
+    template_push_tx: broadcast::Sender<TemplateUpdatePayload>,
 ) -> Result<()> {
     let interval = Duration::from_millis(poll_interval_ms);
     let mut ticker = time::interval(interval);
     let mut previous: Option<AzcoinTemplate> = None;
+    let mut last_push_fp: Option<u64> = None;
     let mut poll_count: u64 = 0;
 
     info!(interval_ms = poll_interval_ms, "Starting template poller");
@@ -80,6 +82,32 @@ pub async fn run(
                     debug!(poll = poll_count, height = template.height, "Template unchanged");
                 }
             },
+        }
+
+        let fp = template_push_fingerprint(&template);
+        let fp_changed = last_push_fp != Some(fp);
+        if fp_changed {
+            if last_push_fp.is_some() {
+                info!(
+                    poll = poll_count,
+                    height = template.height,
+                    prev_hash = %template.previous_block_hash,
+                    fingerprint = fp,
+                    "Template change detected (SV2 push fingerprint)"
+                );
+            }
+            match template_push_tx.send(TemplateUpdatePayload {
+                template: template.clone(),
+            }) {
+                Ok(n) => info!(
+                    poll = poll_count,
+                    receivers = n,
+                    height = template.height,
+                    "Template update queued for SV2 pool sessions"
+                ),
+                Err(_) => debug!(poll = poll_count, "template push channel closed; skip SV2 queue"),
+            }
+            last_push_fp = Some(fp);
         }
 
         let _ = template_tx.send(Some(template.clone()));
