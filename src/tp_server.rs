@@ -440,12 +440,50 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
     tmpl: &AzcoinTemplate,
     peer: SocketAddr,
 ) -> Result<()> {
+    info!(
+        peer = %peer,
+        height = tmpl.height,
+        "send_template_pair: start"
+    );
     let template_id = tmpl.height.max(1);
-    let prev = crate::template::prev_hash_bytes_from_rpc_hex(&tmpl.previous_block_hash)?;
-    let n_bits = crate::template::n_bits_from_bits_hex(&tmpl.bits)?;
-    let target = crate::template::target_bytes_from_hex(&tmpl.target)?;
+    let prev = crate::template::prev_hash_bytes_from_rpc_hex(&tmpl.previous_block_hash)
+        .map_err(|e| {
+            error!(
+                peer = %peer,
+                error = %e,
+                error_debug = ?e,
+                "send_template_pair: error building prev_hash"
+            );
+            e
+        })?;
+    let n_bits = crate::template::n_bits_from_bits_hex(&tmpl.bits).map_err(|e| {
+        error!(
+            peer = %peer,
+            error = %e,
+            error_debug = ?e,
+            "send_template_pair: error parsing bits"
+        );
+        e
+    })?;
+    let target = crate::template::target_bytes_from_hex(&tmpl.target).map_err(|e| {
+        error!(
+            peer = %peer,
+            error = %e,
+            error_debug = ?e,
+            "send_template_pair: error parsing target"
+        );
+        e
+    })?;
 
-    let merkle_flat = tmpl.sv2_merkle_path_hashes()?;
+    let merkle_flat = tmpl.sv2_merkle_path_hashes().map_err(|e| {
+        error!(
+            peer = %peer,
+            error = %e,
+            error_debug = ?e,
+            "send_template_pair: error building merkle path"
+        );
+        e
+    })?;
     let merkle_path: Seq0255<U256<'static>> = merkle_flat
         .iter()
         .map(|b| U256::from(*b))
@@ -474,6 +512,12 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         merkle_path,
     };
 
+    info!(
+        peer = %peer,
+        template_id,
+        msg_type = MESSAGE_TYPE_NEW_TEMPLATE,
+        "send_template_pair: calling write_td_frame for NewTemplate (sending NewTemplate)"
+    );
     write_td_frame(
         stream,
         transport_state,
@@ -482,7 +526,22 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         peer,
         "NewTemplate sent",
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        error!(
+            peer = %peer,
+            template_id,
+            error = %e,
+            error_debug = ?e,
+            "send_template_pair: error during NewTemplate write_td_frame"
+        );
+        e
+    })?;
+    info!(
+        peer = %peer,
+        template_id,
+        "send_template_pair: NewTemplate wire completed (sent NewTemplate checkpoint)"
+    );
 
     let set_prev = SetNewPrevHash {
         template_id,
@@ -492,6 +551,12 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         target: U256::from(target),
     };
 
+    info!(
+        peer = %peer,
+        template_id,
+        msg_type = MESSAGE_TYPE_SET_NEW_PREV_HASH,
+        "send_template_pair: calling write_td_frame for SetNewPrevHash (sending SetNewPrevHash)"
+    );
     write_td_frame(
         stream,
         transport_state,
@@ -500,8 +565,24 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         peer,
         "SetNewPrevHash sent",
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        error!(
+            peer = %peer,
+            template_id,
+            error = %e,
+            error_debug = ?e,
+            "send_template_pair: error during SetNewPrevHash write_td_frame"
+        );
+        e
+    })?;
+    info!(
+        peer = %peer,
+        template_id,
+        "send_template_pair: SetNewPrevHash wire completed (sent SetNewPrevHash checkpoint)"
+    );
 
+    info!(peer = %peer, template_id, "send_template_pair: completed Ok");
     Ok(())
 }
 
@@ -517,17 +598,70 @@ where
     T: Serialize + GetSize,
 {
     let ext = COMMON_MSG_EXTENSION_TYPE;
-    let frame = Sv2Frame::from_message(payload, msg_type, ext, false)
-        .ok_or_else(|| anyhow!("Sv2Frame::from_message failed ({log_message})"))?;
+    info!(
+        peer = %peer,
+        msg_type,
+        extension_type = ext,
+        phase = "before_from_message",
+        "write_td_frame: begin (encode + Noise encrypt + TCP write)"
+    );
+    let frame = match Sv2Frame::from_message(payload, msg_type, ext, false) {
+        Some(f) => f,
+        None => {
+            let e = anyhow!("Sv2Frame::from_message failed ({log_message})");
+            error!(
+                peer = %peer,
+                msg_type,
+                extension_type = ext,
+                error = %e,
+                error_debug = ?e,
+                "write_td_frame: Sv2Frame::from_message returned None"
+            );
+            return Err(e);
+        }
+    };
     let mut enc = NoiseEncoder::<T>::new();
-    let bytes = enc
-        .encode(Frame::Sv2(frame), transport_state)
-        .map_err(|e| anyhow!("Noise encode {log_message}: {:?}", e))?;
-    stream
-        .write_all(bytes.as_ref())
-        .await
-        .with_context(|| format!("write {log_message}"))?;
-    stream.flush().await?;
+    let bytes = match enc.encode(Frame::Sv2(frame), transport_state) {
+        Ok(b) => b,
+        Err(e) => {
+            let err = anyhow!("Noise encode {log_message}: {:?}", e);
+            error!(
+                peer = %peer,
+                msg_type,
+                codec_error = ?e,
+                error = %err,
+                error_debug = ?err,
+                "write_td_frame: NoiseEncoder::encode failed"
+            );
+            return Err(err);
+        }
+    };
+    info!(
+        peer = %peer,
+        msg_type,
+        phase = "before_tcp_write",
+        "write_td_frame: encoded; writing to socket"
+    );
+    if let Err(e) = stream.write_all(bytes.as_ref()).await {
+        error!(
+            peer = %peer,
+            msg_type,
+            error = %e,
+            error_debug = ?e,
+            "write_td_frame: TcpStream::write_all failed"
+        );
+        return Err(e.into());
+    }
+    if let Err(e) = stream.flush().await {
+        error!(
+            peer = %peer,
+            msg_type,
+            error = %e,
+            error_debug = ?e,
+            "write_td_frame: TcpStream::flush failed"
+        );
+        return Err(e.into());
+    }
     info!(
         peer = %peer,
         msg_type,
@@ -570,21 +704,51 @@ async fn drain_encrypted_frames_with_live_updates(
                         prev_hash = %payload.template.previous_block_hash,
                         "Template update dequeued for SV2 session"
                     );
+                    info!(
+                        peer = %peer_w,
+                        height = payload.template.height,
+                        "SV2 live writer: requesting codec state Mutex lock"
+                    );
                     let mut g = w_state.lock().await;
-                    if let Err(e) =
-                        send_template_pair(&mut wh, &mut *g, &payload.template, peer_w).await
-                    {
-                        warn!(
-                            peer = %peer_w,
-                            "SV2 live template push failed: {:#}",
-                            e
-                        );
-                        info!(
-                            peer = %peer_w,
-                            reason = "send_template_pair_error",
-                            "SV2 live template writer task: recv loop exiting"
-                        );
-                        break;
+                    info!(
+                        peer = %peer_w,
+                        height = payload.template.height,
+                        "SV2 live writer: acquired codec state Mutex lock"
+                    );
+                    info!(
+                        peer = %peer_w,
+                        height = payload.template.height,
+                        "SV2 live writer: calling send_template_pair"
+                    );
+                    match send_template_pair(&mut wh, &mut *g, &payload.template, peer_w).await {
+                        Ok(()) => {
+                            info!(
+                                peer = %peer_w,
+                                height = payload.template.height,
+                                "SV2 live writer: send_template_pair completed Ok"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                peer = %peer_w,
+                                height = payload.template.height,
+                                error = %e,
+                                error_debug = ?e,
+                                "SV2 live writer: send_template_pair returned error (full error)"
+                            );
+                            warn!(
+                                peer = %peer_w,
+                                "SV2 live template push failed: {:#}",
+                                e
+                            );
+                            info!(
+                                peer = %peer_w,
+                                reason = "send_template_pair_error_after_live_payload",
+                                height = payload.template.height,
+                                "SV2 live template writer task: recv loop exiting"
+                            );
+                            break;
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
