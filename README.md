@@ -4,10 +4,10 @@ Rust service that sits between `azcoind` and an SV2 mining pool.
 It polls `azcoind` for block templates over JSON-RPC and exposes a
 Noise-authenticated TCP listener where `pool_sv2` connects.  After the
 Noise NX handshake, the listener completes the **first** SV2 application
-exchange: it accepts `SetupConnection` for the Template Distribution
-protocol and replies with `SetupConnectionSuccess` (or a clear
-`SetupConnectionError`).  **Only** that exchange is implemented at the
-application layer; template distribution (`NewTemplate`, etc.) is not.
+exchange: it accepts `SetupConnection` as a **common message** (`extension_type = 0` per
+`pool_sv2`), checks the **payload** `protocol` field for Template Distribution, and replies with
+`SetupConnectionSuccess` (or `SetupConnectionError`).  **Only** that exchange is implemented at
+the application layer; template distribution (`NewTemplate`, etc.) is not.
 
 ## Project Structure
 
@@ -71,11 +71,13 @@ azcoin-template-provider/
 - Expose helper RPC wrappers: `getblockchaininfo`, `getblocktemplate`,
   `submitblock`, `getbestblockhash`, `getblockheader`.
 - **SV2 TP (Noise + SetupConnection)**: Bind on `tp_listen_address`, run
-  Noise NX, then decrypt the first SV2 frame with `codec_sv2`, validate
-  `SetupConnection` for Template Distribution (protocol version 2), and
-  send `SetupConnectionSuccess` or `SetupConnectionError`.  Further
-  encrypted frames are decrypted and logged by header only; payloads are
-  not handled.
+  Noise NX, then decrypt the first SV2 frame with `codec_sv2`.  Expect
+  **common-message framing** (`extension_type == 0`, `channel_msg == false`);
+  subprotocol is determined from the decoded `SetupConnection.protocol`
+  field (must be Template Distribution).  Negotiate protocol version **2**;
+  send `SetupConnectionSuccess` or `SetupConnectionError` (also on
+  extension type **0**).  Further encrypted frames are decrypted and logged
+  by header only; payloads are not handled.
 - Share the latest polled template in-process via a `watch` channel
   (ready for template distribution in a later phase).
 - Graceful fallback to poller-only mode when authority keys are not
@@ -103,9 +105,10 @@ Stratum V2 reference crates: `noise_sv2` for the NX handshake,
 **What works now:**
 - TCP bind on the configured `tp_listen_address` (default `0.0.0.0:8442`)
 - Full Noise NX handshake per connection (responder)
-- First encrypted SV2 frame: decrypt, verify header (`msg_type` =
-  `SetupConnection`, extension = Template Distribution, no channel bit),
-  decode body, log fields
+- First encrypted SV2 frame: decrypt, **frame-level** checks (`msg_type` =
+  `SetupConnection`, `extension_type == 0`, `channel_msg == false`), then
+  decode body and **payload-level** check `protocol ==` Template
+  Distribution; log both stages distinctly
 - Negotiate protocol version **2** only; reply with
   `SetupConnectionSuccess { used_version, flags: 0 }` or
   `SetupConnectionError` (`unsupported-protocol`, `protocol-version-mismatch`)
@@ -250,9 +253,11 @@ INFO  Noise handshake: waiting for initiator ephemeral key  peer=192.168.1.50:54
 INFO  Noise handshake: computing response  peer=192.168.1.50:54321
 INFO  Noise handshake completed — encrypted transport established  peer=192.168.1.50:54321
 INFO  SV2 application: waiting for first encrypted frame  peer=192.168.1.50:54321
-INFO  Received first encrypted SV2 frame (decrypted for parsing)  peer=... cipher_bytes=... msg_type=0 extension_type=2 ...
-INFO  Decoded SetupConnection  peer=... setup="SetupConnection(protocol: 2, ..."
-INFO  Sent SetupConnectionSuccess (template distribution; flags=0)  peer=... used_version=2
+INFO  Raw frame: first post-Noise ciphertext assembled and decrypted...  peer=... cipher_bytes=... msg_type=0 extension_type=0 ...
+INFO  Frame-level validation passed (SetupConnection, extension_type=0, channel_msg=false)  peer=...
+INFO  Decoded SetupConnection body  peer=... setup="SetupConnection(protocol: 2, ..."
+INFO  Payload-level validation passed (SetupConnection.protocol = Template Distribution)  peer=...
+INFO  Response sent: SetupConnectionSuccess (common-message frame; template distribution negotiated in payload)  peer=... used_version=2 extension_type=0
 INFO  Session idle read loop (post-SetupConnection; payloads not decoded)  peer=...
 INFO  Template changed: new block: height 201 -> 202, prev_hash aabb0011..44556677
 INFO  SV2 client disconnected  peer=192.168.1.50:54321

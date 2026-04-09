@@ -1,9 +1,10 @@
 //! SV2 Template Provider — Noise transport + first application message (`SetupConnection`).
 //!
-//! After the Noise NX handshake, decrypts the first SV2 frame with [`codec_sv2::StandardNoiseDecoder`],
-//! validates [`SetupConnection`] for the Template Distribution role, and replies with
-//! [`SetupConnectionSuccess`] or [`SetupConnectionError`].  Further encrypted frames are read and
-//! logged at header level only (payload not decoded).
+//! After the Noise NX handshake, decrypts the first SV2 frame with [`codec_sv2::StandardNoiseDecoder`].
+//! `SetupConnection` uses **common-message framing** (`extension_type == 0`); the negotiated
+//! subprotocol is read from [`SetupConnection::protocol`] (must be Template Distribution for this
+//! role).  Replies with [`SetupConnectionSuccess`] or [`SetupConnectionError`].  Further encrypted
+//! frames are read and logged at header level only (payload not decoded).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use codec_sv2::{Error as CodecError, NoiseEncoder, StandardNoiseDecoder};
 use common_messages_sv2::{
     Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
     MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
-    MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT,
+    MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
 };
 use framing_sv2::header::Header;
 use framing_sv2::framing::{Frame, Sv2Frame};
@@ -32,6 +33,10 @@ const CERT_VALIDITY: Duration = Duration::from_secs(86400);
 /// Upstream protocol version we negotiate (SV2).
 const SUPPORTED_MIN_VERSION: u16 = 2;
 const SUPPORTED_MAX_VERSION: u16 = 2;
+
+/// Common-message framing: `SetupConnection` / `SetupConnectionSuccess` / `SetupConnectionError`
+/// use `extension_type == 0` (subprotocol is carried in the payload's `protocol` field).
+const COMMON_MSG_EXTENSION_TYPE: u16 = 0;
 
 /// Parse hex-encoded authority keys and start the Noise-authenticated TCP
 /// listener.  Each accepted connection performs a full Noise NX handshake
@@ -129,22 +134,22 @@ async fn handle_connection(
         extension_type = header.ext_type(),
         channel_msg = header.channel_msg(),
         payload_len = payload_bytes.len(),
-        "Received first encrypted SV2 frame (decrypted for parsing)"
+        "Raw frame: first post-Noise ciphertext assembled and decrypted to SV2 header + payload"
     );
 
-    let ext_base = header.ext_type_without_channel_msg();
+    let reply_extension = header.ext_type_without_channel_msg();
 
     if header.msg_type() != MESSAGE_TYPE_SETUP_CONNECTION {
         warn!(
             peer = %peer,
             expected = MESSAGE_TYPE_SETUP_CONNECTION,
             got = header.msg_type(),
-            "First SV2 message is not SetupConnection"
+            "Frame-level reject: msg_type is not SetupConnection"
         );
         send_setup_connection_error(
             &mut stream,
             &mut transport_state,
-            ext_base,
+            reply_extension,
             "unsupported-protocol",
             0,
         )
@@ -153,11 +158,11 @@ async fn handle_connection(
     }
 
     if header.channel_msg() {
-        warn!(peer = %peer, "SetupConnection must not use channel_msg bit");
+        warn!(peer = %peer, "Frame-level reject: common SetupConnection must have channel_msg=false");
         send_setup_connection_error(
             &mut stream,
             &mut transport_state,
-            ext_base,
+            reply_extension,
             "unsupported-protocol",
             0,
         )
@@ -165,17 +170,17 @@ async fn handle_connection(
         return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await;
     }
 
-    if ext_base != SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT as u16 {
+    if header.ext_type() != COMMON_MSG_EXTENSION_TYPE {
         warn!(
             peer = %peer,
-            got = ext_base,
-            expected = SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT,
-            "SetupConnection extension type is not Template Distribution"
+            got = header.ext_type(),
+            expected = COMMON_MSG_EXTENSION_TYPE,
+            "Frame-level reject: SetupConnection must use common-message framing (extension_type=0)"
         );
         send_setup_connection_error(
             &mut stream,
             &mut transport_state,
-            ext_base,
+            reply_extension,
             "unsupported-protocol",
             0,
         )
@@ -183,14 +188,19 @@ async fn handle_connection(
         return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await;
     }
 
+    info!(
+        peer = %peer,
+        "Frame-level validation passed (SetupConnection, extension_type=0, channel_msg=false)"
+    );
+
     let setup: SetupConnection<'_> = match from_bytes(&mut payload_bytes) {
         Ok(m) => m,
         Err(e) => {
-            error!(peer = %peer, "Failed to decode SetupConnection payload: {:?}", e);
+            error!(peer = %peer, "Decode error: SetupConnection payload: {:?}", e);
             send_setup_connection_error(
                 &mut stream,
                 &mut transport_state,
-                ext_base,
+                COMMON_MSG_EXTENSION_TYPE,
                 "unsupported-protocol",
                 0,
             )
@@ -200,24 +210,29 @@ async fn handle_connection(
         }
     };
 
-    info!(peer = %peer, setup = %setup, "Decoded SetupConnection");
+    info!(peer = %peer, setup = %setup, "Decoded SetupConnection body");
 
     if setup.protocol != Protocol::TemplateDistributionProtocol {
         warn!(
             peer = %peer,
             protocol = ?setup.protocol,
-            "Rejected SetupConnection: wrong protocol for Template Provider"
+            "Payload-level reject: SetupConnection.protocol is not Template Distribution (expected for this TP)"
         );
         send_setup_connection_error(
             &mut stream,
             &mut transport_state,
-            ext_base,
+            COMMON_MSG_EXTENSION_TYPE,
             "unsupported-protocol",
             0,
         )
         .await?;
         return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await;
     }
+
+    info!(
+        peer = %peer,
+        "Payload-level validation passed (SetupConnection.protocol = Template Distribution)"
+    );
 
     let used_version = match setup.get_version(SUPPORTED_MIN_VERSION, SUPPORTED_MAX_VERSION) {
         Some(v) => v,
@@ -231,7 +246,7 @@ async fn handle_connection(
             send_setup_connection_error(
                 &mut stream,
                 &mut transport_state,
-                ext_base,
+                COMMON_MSG_EXTENSION_TYPE,
                 "protocol-version-mismatch",
                 0,
             )
@@ -249,7 +264,7 @@ async fn handle_connection(
     let reply = Sv2Frame::from_message(
         success,
         MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
-        SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT as u16,
+        COMMON_MSG_EXTENSION_TYPE,
         false,
     )
     .ok_or_else(|| anyhow!("SetupConnectionSuccess frame construction failed"))?;
@@ -268,13 +283,13 @@ async fn handle_connection(
     info!(
         peer = %peer,
         used_version,
-        "Sent SetupConnectionSuccess (template distribution; flags=0)"
+        extension_type = COMMON_MSG_EXTENSION_TYPE,
+        "Response sent: SetupConnectionSuccess (common-message frame; template distribution negotiated in payload)"
     );
 
     drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await
 }
 
-/// Read one full Noise-encrypted SV2 frame; returns decrypted frame and ciphertext byte count.
 /// Read one Noise-encrypted SV2 frame; copies payload into an owned buffer for decoding.
 async fn read_encrypted_sv2_frame(
     stream: &mut TcpStream,
@@ -349,9 +364,10 @@ async fn send_setup_connection_error(
         .context("failed to send SetupConnectionError")?;
     stream.flush().await?;
     info!(
+        extension_type = extension_type_base,
         error_code = %error_code,
         flags,
-        "Sent SetupConnectionError"
+        "Response sent: SetupConnectionError"
     );
     Ok(())
 }
