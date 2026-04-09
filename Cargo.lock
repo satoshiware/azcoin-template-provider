@@ -113,7 +113,11 @@ name = "azcoin-template-provider"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "binary_sv2",
  "clap",
+ "codec_sv2",
+ "common_messages_sv2",
+ "framing_sv2",
  "hex",
  "noise_sv2",
  "reqwest",
@@ -132,6 +136,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "binary_sv2"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b508acc2616ce7faec993f6b4e4d0aa2227d74103552897bf833413bf7406681"
+dependencies = [
+ "derive_codec_sv2",
+]
+
+[[package]]
 name = "bitcoin_hashes"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,6 +158,15 @@ name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
+
+[[package]]
+name = "buffer_sv2"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5c1cac04b754ae9750cd8b2d9948bd8db2b2b00f8192024a500e7ba8a3fb2eb"
+dependencies = [
+ "aes-gcm",
+]
 
 [[package]]
 name = "bumpalo"
@@ -250,10 +272,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "codec_sv2"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db4fcf7e30280ed8dc8575ea326933acebb699d9617afd8186e4b62fa88c484"
+dependencies = [
+ "binary_sv2",
+ "buffer_sv2",
+ "framing_sv2",
+ "noise_sv2",
+ "rand",
+ "tracing",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+
+[[package]]
+name = "common_messages_sv2"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e54ac792c409c1e0fb0ebdbaa60221d958abbe7b9222c20461b7acc8c9822db"
+dependencies = [
+ "binary_sv2",
+]
 
 [[package]]
 name = "core-foundation"
@@ -308,6 +353,12 @@ checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
 dependencies = [
  "cipher",
 ]
+
+[[package]]
+name = "derive_codec_sv2"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40d67b9d87d96ca3b35000ad98ac7d940ebf8f93527229c5fc0938b0a013ea9e"
 
 [[package]]
 name = "displaydoc"
@@ -391,6 +442,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "framing_sv2"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc22163ceb4d6c0300942035964c466f0c5279fd91dfbae8b01e7295ab30648a"
+dependencies = [
+ "binary_sv2",
+ "noise_sv2",
 ]
 
 [[package]]

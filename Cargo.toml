@@ -6,7 +6,11 @@ description = "RPC adapter for azcoind block templates (SV2 Template Provider â€
 
 [dependencies]
 anyhow = "1"
+binary_sv2 = "5"
 clap = { version = "4", features = ["derive"] }
+codec_sv2 = { version = "5", features = ["noise_sv2"] }
+common_messages_sv2 = "7"
+framing_sv2 = "6"
 hex = "0.4"
 noise_sv2 = "1"
 reqwest = { version = "0.12", features = ["json"] }
