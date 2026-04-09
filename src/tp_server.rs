@@ -20,7 +20,7 @@ use codec_sv2::{Error as CodecError, NoiseEncoder, StandardNoiseDecoder};
 use common_messages_sv2::{
     Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
     MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
-    MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT,
+    MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
 };
 use framing_sv2::header::Header;
 use framing_sv2::framing::{Frame, Sv2Frame};
@@ -334,28 +334,41 @@ async fn run_template_distribution_init(
     let (header, mut payload, cipher_len) =
         read_encrypted_sv2_frame(stream, decoder, transport_state, peer).await?;
 
-    let ext = header.ext_type_without_channel_msg();
     let mt = header.msg_type();
     info!(
         peer = %peer,
         cipher_bytes = cipher_len,
         msg_type = mt,
-        extension_type = ext,
+        extension_type = header.ext_type(),
+        channel_msg = header.channel_msg(),
         payload_len = payload.len(),
         "Inbound frame (post-SetupConnection)"
     );
 
     anyhow::ensure!(
-        ext == SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT as u16,
-        "expected Template Distribution extension type {} (got {})",
-        SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT,
-        ext
+        header.ext_type() == COMMON_MSG_EXTENSION_TYPE && !header.channel_msg(),
+        "expected first post-SetupConnection TD-init frame: extension_type=0, channel_msg=false (got ext={}, channel_msg={})",
+        header.ext_type(),
+        header.channel_msg()
+    );
+
+    info!(
+        peer = %peer,
+        extension_type = COMMON_MSG_EXTENSION_TYPE,
+        channel_msg = false,
+        "Frame-level acceptance: post-SetupConnection frame (common extension, non-channel)"
     );
 
     anyhow::ensure!(
         mt == MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS,
         "expected first TD message CoinbaseOutputConstraints (MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS = 0x70 = 112), got {}",
         mt
+    );
+
+    info!(
+        peer = %peer,
+        msg_type = mt,
+        "TD dispatch by msg_type: CoinbaseOutputConstraints"
     );
 
     let constraints: CoinbaseOutputConstraints = from_bytes(&mut payload)
@@ -368,7 +381,7 @@ async fn run_template_distribution_init(
         msg_type_decimal = mt as u16,
         msg_type_hex = "0x70",
         constant = "MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS",
-        "Decoded inbound Template Distribution message"
+        "Decoded CoinbaseOutputConstraints payload"
     );
 
     let tmpl = wait_for_template(template_rx).await?;
@@ -468,7 +481,8 @@ async fn send_noise_td<T>(
 where
     T: Serialize + GetSize,
 {
-    let ext = SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT as u16;
+    // Same common extension as inbound TD frames (`pool_sv2` / protocol classifier).
+    let ext = COMMON_MSG_EXTENSION_TYPE;
     let frame = Sv2Frame::from_message(payload, msg_type, ext, false)
         .ok_or_else(|| anyhow!("Sv2Frame::from_message failed ({label})"))?;
     let mut enc = NoiseEncoder::<T>::new();
@@ -483,6 +497,7 @@ where
     info!(
         peer = %peer,
         msg_type,
+        extension_type = ext,
         label,
         "Outbound Template Distribution message sent"
     );

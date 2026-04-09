@@ -1,6 +1,6 @@
 git status
 git add -A
-git commit -m "Establishing first version of azcoin-template-provider v0.1.0"   
+git commit -m "Finalizing the first version of azcoin-template-provider fixed 2 mismatches with the reference implementation v0.1.0"   
 git tag v0.1.0
 git push origin main
 git push origin v0.1.0

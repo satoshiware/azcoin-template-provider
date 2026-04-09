@@ -76,9 +76,11 @@ azcoin-template-provider/
   Bind on `tp_listen_address`, run Noise NX, then handle `SetupConnection`
   as above (common messages on extension **0**, Template Distribution in
   the payload, version **2**).  After `SetupConnectionSuccess`, read the next
-  encrypted frame: expect Template Distribution extension and
-  `CoinbaseOutputConstraints` (`MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS`,
-  decimal **112**).  Decode it, take the latest `AzcoinTemplate` from the
+  encrypted frame with the same **common** framing (`extension_type == 0`,
+  `channel_msg == false`), then recognize Template Distribution by
+  **`msg_type`** (`CoinbaseOutputConstraints` /
+  `MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS`, decimal **112**).  Decode it,
+  take the latest `AzcoinTemplate` from the
   `watch` channel, and send **`NewTemplate`** (merkle path from template tx
   `data` hex + placeholder coinbase leaf) then **`SetNewPrevHash`** (prev
   hash, `nBits`, target, timestamp from the template).  Any further frames
@@ -120,15 +122,20 @@ Stratum V2 reference crates: `noise_sv2` for the NX handshake,
 - Negotiate protocol version **2** only; reply with
   `SetupConnectionSuccess { used_version, flags: 0 }` or
   `SetupConnectionError` (`unsupported-protocol`, `protocol-version-mismatch`)
-- **Inbound (Template Distribution):** decode the first post-success frame
-  as `CoinbaseOutputConstraints` when `msg_type == 112` (**0x70**,
-  `MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS`) and extension is Template
-  Distribution (`SV2_TEMPLATE_DISTRIBUTION_PROTOCOL_DISCRIMINANT`)
+- **Inbound (Template Distribution):** **frame-level** accept the first
+  post-success frame when `extension_type == 0` and `channel_msg == false`
+  (same as common messages); **dispatch** by `msg_type` — decode
+  `CoinbaseOutputConstraints` when `msg_type == 112` (**0x70**,
+  `MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS`)
 - **Outbound (Template Distribution):** send **`NewTemplate`** then
-  **`SetNewPrevHash`** using the latest `AzcoinTemplate` from the poller
-  (`template_id` = `height.max(1)`; merkle path from GBT transaction `data`
-  hex; empty coinbase prefix/outputs placeholder; `future_template: true`)
-- Logging: inbound TD message type and decoded constraints; each outbound TD
+  **`SetNewPrevHash`** with **`extension_type == 0`** and **`channel_msg == false`**
+  (aligned with inbound TD framing and `pool_sv2`’s protocol classifier — not
+  subprotocol discriminant **2** on the wire).  Payloads use the latest
+  `AzcoinTemplate` from the poller (`template_id` = `height.max(1)`; merkle path
+  from GBT transaction `data` hex; empty coinbase prefix/outputs placeholder;
+  `future_template: true`).
+- Logging: frame-level acceptance vs TD dispatch by `msg_type`, decoded
+  constraints; each outbound TD
   `msg_type` / label; summary with template height and RPC prev-hash string
 - After that pair: keep reading encrypted frames, decrypt with the same
   session, log `msg_type` / extension / payload length (payload not parsed)
@@ -277,10 +284,12 @@ INFO  Decoded SetupConnection body  peer=... setup="SetupConnection(protocol: 2,
 INFO  Payload-level validation passed (SetupConnection.protocol = Template Distribution)  peer=...
 INFO  Response sent: SetupConnectionSuccess (common-message frame; template distribution negotiated in payload)  peer=... used_version=2 extension_type=0
 INFO  Waiting for first Template Distribution message after SetupConnectionSuccess  peer=...
-INFO  Inbound frame (post-SetupConnection)  peer=... msg_type=112 extension_type=2 ...
-INFO  Decoded inbound Template Distribution message  peer=... constant="MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS" ...
-INFO  Outbound Template Distribution message sent  peer=... label="NewTemplate" ...
-INFO  Outbound Template Distribution message sent  peer=... label="SetNewPrevHash" ...
+INFO  Inbound frame (post-SetupConnection)  peer=... msg_type=112 extension_type=0 channel_msg=false ...
+INFO  Frame-level acceptance: post-SetupConnection frame (common extension, non-channel)  peer=...
+INFO  TD dispatch by msg_type: CoinbaseOutputConstraints  peer=...
+INFO  Decoded CoinbaseOutputConstraints payload  peer=... constant="MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS" ...
+INFO  Outbound Template Distribution message sent  peer=... msg_type=... extension_type=0 label="NewTemplate" ...
+INFO  Outbound Template Distribution message sent  peer=... msg_type=... extension_type=0 label="SetNewPrevHash" ...
 INFO  Initial template + prevhash sent to pool  peer=... template_id=... height=... prev_hash_rpc_hex="..."
 INFO  Session idle read loop (post-SetupConnection; payloads not decoded)  peer=...
 INFO  Template changed: new block: height 201 -> 202, prev_hash aabb0011..44556677
