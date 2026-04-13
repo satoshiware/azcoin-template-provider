@@ -6,6 +6,7 @@ mod template;
 mod tp_server;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -45,14 +46,16 @@ async fn main() -> Result<()> {
         "Configuration loaded"
     );
 
-    let client = rpc::RpcClient::new(
-        cfg.rpc_url.clone(),
-        cfg.rpc_user.clone(),
-        cfg.rpc_password.clone(),
-    )
-    .with_template_rules(cfg.template_rules.clone());
+    let client = Arc::new(
+        rpc::RpcClient::new(
+            cfg.rpc_url.clone(),
+            cfg.rpc_user.clone(),
+            cfg.rpc_password.clone(),
+        )
+        .with_template_rules(cfg.template_rules.clone()),
+    );
 
-    health::check_rpc_connectivity(&client, &cfg).await?;
+    health::check_rpc_connectivity(client.as_ref(), &cfg).await?;
 
     let (template_tx, template_rx) = tokio::sync::watch::channel(None);
     let (template_push_tx, _) =
@@ -67,20 +70,22 @@ async fn main() -> Result<()> {
             "Starting SV2 Template Provider (Noise-authenticated)"
         );
         let push = template_push_tx.clone();
+        let rpc_tp = client.clone();
         tokio::select! {
-            res = poller::run(&client, cfg.poll_interval_ms, template_tx, push) => res,
+            res = poller::run(client.as_ref(), cfg.poll_interval_ms, template_tx, push) => res,
             res = tp_server::run(
                 &cfg.tp_listen_address,
                 &cfg.authority_public_key,
                 &cfg.authority_secret_key,
                 template_rx,
                 template_push_tx,
+                rpc_tp,
             ) => res,
         }
     } else {
         warn!("authority keys not configured — SV2 TP listener disabled (poller-only mode)");
         poller::run(
-            &client,
+            client.as_ref(),
             cfg.poll_interval_ms,
             template_tx,
             template_push_tx,

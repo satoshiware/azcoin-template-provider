@@ -16,6 +16,11 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use binary_sv2::{from_bytes, GetSize, Seq0255, Serialize, Str0255, U256};
+use bitcoin::blockdata::block::{Block, Header as BlockHeader, Version};
+use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::hashes::Hash;
+use bitcoin::pow::CompactTarget;
+use bitcoin::{BlockHash, Transaction, TxMerkleNode};
 use codec_sv2::{Error as CodecError, NoiseEncoder, StandardNoiseDecoder};
 use common_messages_sv2::{
     Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
@@ -26,9 +31,9 @@ use framing_sv2::header::Header;
 use framing_sv2::framing::{Frame, Sv2Frame};
 use noise_sv2::Responder;
 use template_distribution_sv2::{
-    CoinbaseOutputConstraints, NewTemplate, SetNewPrevHash,
+    CoinbaseOutputConstraints, NewTemplate, SetNewPrevHash, SubmitSolution,
     MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS, MESSAGE_TYPE_NEW_TEMPLATE,
-    MESSAGE_TYPE_SET_NEW_PREV_HASH,
+    MESSAGE_TYPE_SET_NEW_PREV_HASH, MESSAGE_TYPE_SUBMIT_SOLUTION,
 };
 use std::sync::Arc;
 
@@ -37,6 +42,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{debug, error, info, warn};
 
+use crate::rpc::RpcClient;
 use crate::template::{AzcoinTemplate, TemplateUpdatePayload};
 
 /// Certificate validity period used when constructing the Noise responder.
@@ -59,6 +65,7 @@ pub async fn run(
     authority_secret_key_hex: &str,
     template_rx: watch::Receiver<Option<AzcoinTemplate>>,
     template_push_tx: broadcast::Sender<TemplateUpdatePayload>,
+    rpc: Arc<RpcClient>,
 ) -> Result<()> {
     let pub_key = decode_key(authority_public_key_hex, "authority_public_key")?;
     let sec_key = decode_key(authority_secret_key_hex, "authority_secret_key")?;
@@ -79,8 +86,9 @@ pub async fn run(
                 let sk = sec_key;
                 let rx = template_rx.clone();
                 let push = template_push_tx.clone();
+                let rpc_c = rpc.clone();
                 tokio::spawn(async move {
-                    match handle_connection(stream, peer, &pk, &sk, rx, push).await {
+                    match handle_connection(stream, peer, &pk, &sk, rx, push, rpc_c).await {
                         Ok(()) => {}
                         Err(e) => warn!(peer = %peer, "SV2 session ended: {:#}", e),
                     }
@@ -100,6 +108,7 @@ async fn handle_connection(
     authority_sec: &[u8; 32],
     mut template_rx: watch::Receiver<Option<AzcoinTemplate>>,
     template_push_tx: broadcast::Sender<TemplateUpdatePayload>,
+    rpc: Arc<RpcClient>,
 ) -> Result<()> {
     // ---- Noise NX handshake (responder side) --------------------------------
 
@@ -169,7 +178,15 @@ async fn handle_connection(
             0,
         )
         .await?;
-        return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await;
+        return drain_encrypted_frames(
+            &mut stream,
+            &mut decoder,
+            &mut transport_state,
+            peer,
+            rpc.clone(),
+            template_rx.clone(),
+        )
+        .await;
     }
 
     if header.channel_msg() {
@@ -182,7 +199,15 @@ async fn handle_connection(
             0,
         )
         .await?;
-        return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await;
+        return drain_encrypted_frames(
+            &mut stream,
+            &mut decoder,
+            &mut transport_state,
+            peer,
+            rpc.clone(),
+            template_rx.clone(),
+        )
+        .await;
     }
 
     if header.ext_type() != COMMON_MSG_EXTENSION_TYPE {
@@ -200,7 +225,15 @@ async fn handle_connection(
             0,
         )
         .await?;
-        return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await;
+        return drain_encrypted_frames(
+            &mut stream,
+            &mut decoder,
+            &mut transport_state,
+            peer,
+            rpc.clone(),
+            template_rx.clone(),
+        )
+        .await;
     }
 
     info!(
@@ -220,8 +253,15 @@ async fn handle_connection(
                 0,
             )
             .await?;
-            return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer)
-                .await;
+            return drain_encrypted_frames(
+                &mut stream,
+                &mut decoder,
+                &mut transport_state,
+                peer,
+                rpc.clone(),
+                template_rx.clone(),
+            )
+            .await;
         }
     };
 
@@ -241,7 +281,15 @@ async fn handle_connection(
             0,
         )
         .await?;
-        return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await;
+        return drain_encrypted_frames(
+            &mut stream,
+            &mut decoder,
+            &mut transport_state,
+            peer,
+            rpc.clone(),
+            template_rx.clone(),
+        )
+        .await;
     }
 
     info!(
@@ -266,8 +314,15 @@ async fn handle_connection(
                 0,
             )
             .await?;
-            return drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer)
-                .await;
+            return drain_encrypted_frames(
+                &mut stream,
+                &mut decoder,
+                &mut transport_state,
+                peer,
+                rpc.clone(),
+                template_rx.clone(),
+            )
+            .await;
         }
     };
 
@@ -326,6 +381,8 @@ async fn handle_connection(
                 transport_state,
                 peer,
                 upd_rx,
+                rpc.clone(),
+                template_rx.clone(),
             )
             .await
         }
@@ -335,7 +392,15 @@ async fn handle_connection(
                 "Template distribution init failed (pool may retry or disconnect): {:#}",
                 e
             );
-            drain_encrypted_frames(&mut stream, &mut decoder, &mut transport_state, peer).await
+            drain_encrypted_frames(
+                &mut stream,
+                &mut decoder,
+                &mut transport_state,
+                peer,
+                rpc.clone(),
+                template_rx.clone(),
+            )
+            .await
         }
     }
 }
@@ -671,6 +736,196 @@ where
     Ok(())
 }
 
+/// Consensus-serialized block bytes for [`RpcClient::submitblock`] from pool `SubmitSolution` + GBT snapshot.
+fn block_bytes_from_submit_solution(
+    sol_template_id: u64,
+    header_version: u32,
+    header_timestamp: u32,
+    header_nonce: u32,
+    coinbase_raw: &[u8],
+    tmpl: &AzcoinTemplate,
+) -> Result<Vec<u8>> {
+    let expected_tid = tmpl.height.max(1);
+    if sol_template_id != expected_tid {
+        anyhow::bail!(
+            "SubmitSolution.template_id {} mismatches active template_id {}",
+            sol_template_id,
+            expected_tid
+        );
+    }
+    let coinbase: Transaction =
+        deserialize(coinbase_raw).context("deserialize SubmitSolution.coinbase_tx")?;
+    let mut txdata = vec![coinbase];
+    for tx in &tmpl.transactions {
+        let raw = hex::decode(tx.data.trim()).context("hex-decode GBT transaction.data")?;
+        txdata.push(deserialize(&raw).context("deserialize GBT transaction")?);
+    }
+    let bits_u32 = crate::template::n_bits_from_bits_hex(&tmpl.bits)?;
+    let prev_inner = crate::template::prev_hash_bytes_from_rpc_hex(&tmpl.previous_block_hash)?;
+    let prev_blockhash = BlockHash::from_byte_array(prev_inner);
+    let version = Version::from_consensus(header_version as i32);
+    let bits = CompactTarget::from_consensus(bits_u32);
+    let wip_header = BlockHeader {
+        version,
+        prev_blockhash,
+        merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+        time: header_timestamp,
+        bits,
+        nonce: header_nonce,
+    };
+    let wip = Block {
+        header: wip_header,
+        txdata: txdata.clone(),
+    };
+    let merkle_root = wip
+        .compute_merkle_root()
+        .ok_or_else(|| anyhow!("compute_merkle_root returned None"))?;
+    let header = BlockHeader {
+        version,
+        prev_blockhash,
+        merkle_root,
+        time: header_timestamp,
+        bits,
+        nonce: header_nonce,
+    };
+    let block = Block { header, txdata };
+    Ok(serialize(&block))
+}
+
+async fn log_and_dispatch_post_init_sv2_frame(
+    peer: SocketAddr,
+    h: Header,
+    mut payload: Vec<u8>,
+    cipher_bytes: usize,
+    rpc: Arc<RpcClient>,
+    template_rx: &watch::Receiver<Option<AzcoinTemplate>>,
+) {
+    let msg_type = h.msg_type();
+    let ext_type = h.ext_type();
+    let channel_msg = h.channel_msg();
+    if ext_type == COMMON_MSG_EXTENSION_TYPE
+        && !channel_msg
+        && msg_type == MESSAGE_TYPE_SUBMIT_SOLUTION
+    {
+        info!(
+            peer = %peer,
+            msg_type = msg_type,
+            msg_type_hex = "0x76",
+            extension_type = ext_type,
+            channel_msg = channel_msg,
+            payload_len = payload.len(),
+            cipher_bytes = cipher_bytes,
+            constant = "MESSAGE_TYPE_SUBMIT_SOLUTION",
+            "TD SubmitSolution frame recognized (msg_type=118)"
+        );
+        match from_bytes::<SubmitSolution>(&mut payload) {
+            Ok(sol) => {
+                let coinbase_raw = sol.coinbase_tx.inner_as_ref().to_vec();
+                let template_id = sol.template_id;
+                let header_version = sol.version;
+                let header_timestamp = sol.header_timestamp;
+                let header_nonce = sol.header_nonce;
+                info!(
+                    peer = %peer,
+                    template_id = template_id,
+                    header_version = header_version,
+                    header_timestamp = header_timestamp,
+                    header_nonce = header_nonce,
+                    coinbase_len = coinbase_raw.len(),
+                    decode_ok = true,
+                    "SubmitSolution decode succeeded"
+                );
+                let tmpl = match template_rx.borrow().clone() {
+                    Some(t) => t,
+                    None => {
+                        warn!(
+                            peer = %peer,
+                            template_id = template_id,
+                            "SubmitSolution: no template in watch channel; skipping submitblock"
+                        );
+                        return;
+                    }
+                };
+                let block_res = block_bytes_from_submit_solution(
+                    template_id,
+                    header_version,
+                    header_timestamp,
+                    header_nonce,
+                    &coinbase_raw,
+                    &tmpl,
+                );
+                let block_hex = match block_res {
+                    Ok(bytes) => hex::encode(bytes),
+                    Err(e) => {
+                        warn!(
+                            peer = %peer,
+                            template_id = template_id,
+                            error = %e,
+                            error_debug = ?e,
+                            "SubmitSolution: failed to assemble block for submitblock"
+                        );
+                        return;
+                    }
+                };
+                info!(
+                    peer = %peer,
+                    template_id = template_id,
+                    block_hex_len = block_hex.len(),
+                    submitblock_invoked = true,
+                    "calling submitblock RPC"
+                );
+                match rpc.submit_block(&block_hex).await {
+                    Ok(None) => {
+                        info!(
+                            peer = %peer,
+                            template_id = template_id,
+                            accepted = true,
+                            "submitblock: node accepted block (null result)"
+                        );
+                    }
+                    Ok(Some(reason)) => {
+                        info!(
+                            peer = %peer,
+                            template_id = template_id,
+                            accepted = false,
+                            rejection = %reason,
+                            "submitblock: node rejected block (string result)"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            peer = %peer,
+                            template_id = template_id,
+                            error = %e,
+                            error_debug = ?e,
+                            "submitblock: RPC error"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    peer = %peer,
+                    msg_type = msg_type,
+                    decode_ok = false,
+                    error = ?e,
+                    "SubmitSolution decode failed"
+                );
+            }
+        }
+        return;
+    }
+
+    info!(
+        peer = %peer,
+        cipher_bytes = cipher_bytes,
+        msg_type = msg_type,
+        extension_type = ext_type,
+        payload_len = payload.len(),
+        "Received encrypted SV2 frame (not handled at application layer)"
+    );
+}
+
 async fn drain_encrypted_frames_with_live_updates(
     mut read_half: tokio::net::tcp::OwnedReadHalf,
     write_half: tokio::net::tcp::OwnedWriteHalf,
@@ -678,6 +933,8 @@ async fn drain_encrypted_frames_with_live_updates(
     transport_state: codec_sv2::State,
     peer: SocketAddr,
     mut upd_rx: broadcast::Receiver<TemplateUpdatePayload>,
+    rpc: Arc<RpcClient>,
+    template_rx: watch::Receiver<Option<AzcoinTemplate>>,
 ) -> Result<()> {
     let state = Arc::new(Mutex::new(transport_state));
     let w_state = Arc::clone(&state);
@@ -783,14 +1040,15 @@ async fn drain_encrypted_frames_with_live_updates(
         };
         match frame_result {
             Ok((h, payload, cipher_len)) => {
-                info!(
-                    peer = %peer,
-                    cipher_bytes = cipher_len,
-                    msg_type = h.msg_type(),
-                    extension_type = h.ext_type(),
-                    payload_len = payload.len(),
-                    "Received encrypted SV2 frame (not handled at application layer)"
-                );
+                log_and_dispatch_post_init_sv2_frame(
+                    peer,
+                    h,
+                    payload,
+                    cipher_len,
+                    rpc.clone(),
+                    &template_rx,
+                )
+                .await;
             }
             Err(e) => {
                 if is_unexpected_eof(&e) {
@@ -901,20 +1159,23 @@ async fn drain_encrypted_frames(
     decoder: &mut StandardNoiseDecoder<SetupConnection<'_>>,
     state: &mut codec_sv2::State,
     peer: SocketAddr,
+    rpc: Arc<RpcClient>,
+    template_rx: watch::Receiver<Option<AzcoinTemplate>>,
 ) -> Result<()> {
     info!(peer = %peer, "Session idle read loop (post-SetupConnection; payloads not decoded)");
 
     loop {
         match read_encrypted_sv2_frame(stream, decoder, state, peer).await {
             Ok((h, payload, cipher_len)) => {
-                info!(
-                    peer = %peer,
-                    cipher_bytes = cipher_len,
-                    msg_type = h.msg_type(),
-                    extension_type = h.ext_type(),
-                    payload_len = payload.len(),
-                    "Received encrypted SV2 frame (not handled at application layer)"
-                );
+                log_and_dispatch_post_init_sv2_frame(
+                    peer,
+                    h,
+                    payload,
+                    cipher_len,
+                    rpc.clone(),
+                    &template_rx,
+                )
+                .await;
             }
             Err(e) => {
                 if is_unexpected_eof(&e) {

@@ -143,7 +143,6 @@ impl RpcClient {
 
     /// Submit a fully-serialised block.  Returns `None` on acceptance or
     /// `Some(reason)` on rejection.
-    #[allow(dead_code)]
     pub async fn submit_block(&self, block_hex: &str) -> Result<Option<String>> {
         self.call("submitblock", &[json!(block_hex)]).await
     }
