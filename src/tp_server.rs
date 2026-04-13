@@ -10,6 +10,7 @@
 //! [`SetNewPrevHash`]: template_distribution_sv2::SetNewPrevHash
 //! [`AzcoinTemplate`]: crate::template::AzcoinTemplate
 
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -55,6 +56,37 @@ const SUPPORTED_MAX_VERSION: u16 = 2;
 /// Common-message framing: `SetupConnection` / `SetupConnectionSuccess` / `SetupConnectionError`
 /// use `extension_type == 0` (subprotocol is carried in the payload's `protocol` field).
 const COMMON_MSG_EXTENSION_TYPE: u16 = 0;
+
+/// Recent GBT snapshots keyed by SV2 `template_id` (`height.max(1)`), for `SubmitSolution` assembly
+/// after newer templates were already pushed on this session.
+const TEMPLATE_ID_CACHE_CAP: usize = 32;
+
+type TemplateIdCache = Arc<std::sync::Mutex<HashMap<u64, AzcoinTemplate>>>;
+
+fn template_id_for_cache(tmpl: &AzcoinTemplate) -> u64 {
+    tmpl.height.max(1)
+}
+
+fn insert_template_id_cache(cache: &TemplateIdCache, tmpl: &AzcoinTemplate) {
+    let tid = template_id_for_cache(tmpl);
+    let mut m = cache.lock().expect("template_id cache lock");
+    m.insert(tid, tmpl.clone());
+    while m.len() > TEMPLATE_ID_CACHE_CAP {
+        if let Some(k) = m.keys().min().copied() {
+            m.remove(&k);
+        } else {
+            break;
+        }
+    }
+    let len = m.len();
+    drop(m);
+    info!(
+        template_id = tid,
+        cache_len = len,
+        height = tmpl.height,
+        "template_id cache: inserted snapshot"
+    );
+}
 
 /// Parse hex-encoded authority keys and start the Noise-authenticated TCP
 /// listener.  Each accepted connection performs a full Noise NX handshake
@@ -110,6 +142,8 @@ async fn handle_connection(
     template_push_tx: broadcast::Sender<TemplateUpdatePayload>,
     rpc: Arc<RpcClient>,
 ) -> Result<()> {
+    let template_cache: TemplateIdCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
     // ---- Noise NX handshake (responder side) --------------------------------
 
     info!(peer = %peer, "Noise handshake: creating responder");
@@ -185,6 +219,7 @@ async fn handle_connection(
             peer,
             rpc.clone(),
             template_rx.clone(),
+            template_cache.clone(),
         )
         .await;
     }
@@ -206,6 +241,7 @@ async fn handle_connection(
             peer,
             rpc.clone(),
             template_rx.clone(),
+            template_cache.clone(),
         )
         .await;
     }
@@ -232,6 +268,7 @@ async fn handle_connection(
             peer,
             rpc.clone(),
             template_rx.clone(),
+            template_cache.clone(),
         )
         .await;
     }
@@ -260,6 +297,7 @@ async fn handle_connection(
                 peer,
                 rpc.clone(),
                 template_rx.clone(),
+                template_cache.clone(),
             )
             .await;
         }
@@ -288,6 +326,7 @@ async fn handle_connection(
             peer,
             rpc.clone(),
             template_rx.clone(),
+            template_cache.clone(),
         )
         .await;
     }
@@ -321,6 +360,7 @@ async fn handle_connection(
                 peer,
                 rpc.clone(),
                 template_rx.clone(),
+                template_cache.clone(),
             )
             .await;
         }
@@ -363,6 +403,7 @@ async fn handle_connection(
         &mut transport_state,
         peer,
         &mut template_rx,
+        template_cache.clone(),
     )
     .await
     {
@@ -383,6 +424,7 @@ async fn handle_connection(
                 upd_rx,
                 rpc.clone(),
                 template_rx.clone(),
+                template_cache.clone(),
             )
             .await
         }
@@ -399,6 +441,7 @@ async fn handle_connection(
                 peer,
                 rpc.clone(),
                 template_rx.clone(),
+                template_cache.clone(),
             )
             .await
         }
@@ -413,6 +456,7 @@ async fn run_template_distribution_init(
     transport_state: &mut codec_sv2::State,
     peer: SocketAddr,
     template_rx: &mut watch::Receiver<Option<AzcoinTemplate>>,
+    template_cache: TemplateIdCache,
 ) -> Result<()> {
     info!(
         peer = %peer,
@@ -474,6 +518,7 @@ async fn run_template_distribution_init(
 
     let tmpl = wait_for_template(template_rx).await?;
     send_template_pair(stream, transport_state, &tmpl, peer).await?;
+    insert_template_id_cache(&template_cache, &tmpl);
 
     info!(
         peer = %peer,
@@ -745,12 +790,12 @@ fn block_bytes_from_submit_solution(
     coinbase_raw: &[u8],
     tmpl: &AzcoinTemplate,
 ) -> Result<Vec<u8>> {
-    let expected_tid = tmpl.height.max(1);
-    if sol_template_id != expected_tid {
+    let snapshot_tid = tmpl.height.max(1);
+    if sol_template_id != snapshot_tid {
         anyhow::bail!(
-            "SubmitSolution.template_id {} mismatches active template_id {}",
+            "SubmitSolution.template_id {} does not match resolved snapshot template_id {}",
             sol_template_id,
-            expected_tid
+            snapshot_tid
         );
     }
     let coinbase: Transaction =
@@ -799,6 +844,7 @@ async fn log_and_dispatch_post_init_sv2_frame(
     cipher_bytes: usize,
     rpc: Arc<RpcClient>,
     template_rx: &watch::Receiver<Option<AzcoinTemplate>>,
+    template_cache: TemplateIdCache,
 ) {
     let msg_type = h.msg_type();
     let ext_type = h.ext_type();
@@ -835,13 +881,29 @@ async fn log_and_dispatch_post_init_sv2_frame(
                     decode_ok = true,
                     "SubmitSolution decode succeeded"
                 );
-                let tmpl = match template_rx.borrow().clone() {
-                    Some(t) => t,
+                let tmpl = {
+                    let m = template_cache.lock().expect("template_id cache lock");
+                    m.get(&template_id).cloned()
+                };
+                let tmpl = match tmpl {
+                    Some(t) => {
+                        info!(
+                            peer = %peer,
+                            submitted_template_id = template_id,
+                            resolved_height = t.height,
+                            cache_hit = true,
+                            "SubmitSolution resolved template_id from cache"
+                        );
+                        t
+                    }
                     None => {
+                        let latest_id = template_rx.borrow().as_ref().map(template_id_for_cache);
                         warn!(
                             peer = %peer,
-                            template_id = template_id,
-                            "SubmitSolution: no template in watch channel; skipping submitblock"
+                            submitted_template_id = template_id,
+                            cache_miss = true,
+                            latest_known_template_id = ?latest_id,
+                            "SubmitSolution: no cached template for template_id; skipping submitblock"
                         );
                         return;
                     }
@@ -935,10 +997,12 @@ async fn drain_encrypted_frames_with_live_updates(
     mut upd_rx: broadcast::Receiver<TemplateUpdatePayload>,
     rpc: Arc<RpcClient>,
     template_rx: watch::Receiver<Option<AzcoinTemplate>>,
+    template_cache: TemplateIdCache,
 ) -> Result<()> {
     let state = Arc::new(Mutex::new(transport_state));
     let w_state = Arc::clone(&state);
     let peer_w = peer;
+    let tc_writer = template_cache.clone();
 
     tokio::spawn(async move {
         info!(
@@ -979,6 +1043,7 @@ async fn drain_encrypted_frames_with_live_updates(
                     );
                     match send_template_pair(&mut wh, &mut *g, &payload.template, peer_w).await {
                         Ok(()) => {
+                            insert_template_id_cache(&tc_writer, &payload.template);
                             info!(
                                 peer = %peer_w,
                                 height = payload.template.height,
@@ -1047,6 +1112,7 @@ async fn drain_encrypted_frames_with_live_updates(
                     cipher_len,
                     rpc.clone(),
                     &template_rx,
+                    template_cache.clone(),
                 )
                 .await;
             }
@@ -1161,6 +1227,7 @@ async fn drain_encrypted_frames(
     peer: SocketAddr,
     rpc: Arc<RpcClient>,
     template_rx: watch::Receiver<Option<AzcoinTemplate>>,
+    template_cache: TemplateIdCache,
 ) -> Result<()> {
     info!(peer = %peer, "Session idle read loop (post-SetupConnection; payloads not decoded)");
 
@@ -1174,6 +1241,7 @@ async fn drain_encrypted_frames(
                     cipher_len,
                     rpc.clone(),
                     &template_rx,
+                    template_cache.clone(),
                 )
                 .await;
             }
