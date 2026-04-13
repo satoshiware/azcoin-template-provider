@@ -782,6 +782,42 @@ where
 }
 
 /// Consensus-serialized block bytes for [`RpcClient::submitblock`] from pool `SubmitSolution` + GBT snapshot.
+fn decode_bip34_coinbase_height(script_sig: &[u8]) -> Option<u32> {
+    let (push_len, prefix_len) = match *script_sig.first()? {
+        0x00 => return Some(0),
+        n @ 0x01..=0x4b => (n as usize, 1usize),
+        0x4c => (*script_sig.get(1)? as usize, 2usize),
+        0x4d => (
+            u16::from_le_bytes([*script_sig.get(1)?, *script_sig.get(2)?]) as usize,
+            3usize,
+        ),
+        0x4e => (
+            u32::from_le_bytes([
+                *script_sig.get(1)?,
+                *script_sig.get(2)?,
+                *script_sig.get(3)?,
+                *script_sig.get(4)?,
+            ]) as usize,
+            5usize,
+        ),
+        _ => return None,
+    };
+    if push_len == 0 || push_len > 5 || script_sig.len() < prefix_len + push_len {
+        return None;
+    }
+    let data = &script_sig[prefix_len..prefix_len + push_len];
+    let negative = data.last().map(|b| b & 0x80 != 0).unwrap_or(false);
+    if negative {
+        return None;
+    }
+    let mut value = 0u64;
+    for (idx, byte) in data.iter().enumerate() {
+        let byte = if idx + 1 == data.len() { byte & 0x7f } else { *byte };
+        value |= (byte as u64) << (8 * idx);
+    }
+    u32::try_from(value).ok()
+}
+
 fn block_bytes_from_submit_solution(
     sol_template_id: u64,
     header_version: u32,
@@ -800,6 +836,46 @@ fn block_bytes_from_submit_solution(
     }
     let coinbase: Transaction =
         deserialize(coinbase_raw).context("deserialize SubmitSolution.coinbase_tx")?;
+    info!(
+        submitted_template_id = sol_template_id,
+        resolved_template_height = tmpl.height,
+        resolved_previous_block_hash = %tmpl.previous_block_hash,
+        header_version = header_version,
+        header_timestamp = header_timestamp,
+        header_nonce = header_nonce,
+        bits = %tmpl.bits,
+        coinbase_len = coinbase_raw.len(),
+        "SubmitSolution block assembly inputs"
+    );
+    let first_input = coinbase.input.first();
+    let first_input_script_sig = first_input
+        .map(|txin| hex::encode(txin.script_sig.as_bytes()))
+        .unwrap_or_default();
+    let first_input_prevout = first_input
+        .map(|txin| txin.previous_output.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    let first_input_prevout_is_null = first_input
+        .map(|txin| txin.previous_output.is_null())
+        .unwrap_or(false);
+    let decoded_coinbase_height =
+        first_input.and_then(|txin| decode_bip34_coinbase_height(txin.script_sig.as_bytes()));
+    info!(
+        coinbase_txid = %coinbase.compute_txid(),
+        is_coinbase = coinbase.is_coinbase(),
+        first_input_prevout = %first_input_prevout,
+        first_input_prevout_is_null = first_input_prevout_is_null,
+        first_input_script_sig = %first_input_script_sig,
+        expected_block_height = tmpl.height,
+        decoded_coinbase_height = ?decoded_coinbase_height,
+        "SubmitSolution coinbase diagnostics"
+    );
+    if decoded_coinbase_height.map(u64::from) != Some(tmpl.height) {
+        warn!(
+            expected_block_height = tmpl.height,
+            decoded_coinbase_height = ?decoded_coinbase_height,
+            "SubmitSolution coinbase height mismatch"
+        );
+    }
     let mut txdata = vec![coinbase];
     for tx in &tmpl.transactions {
         let raw = hex::decode(tx.data.trim()).context("hex-decode GBT transaction.data")?;
