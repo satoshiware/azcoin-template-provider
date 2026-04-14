@@ -21,7 +21,7 @@ use bitcoin::blockdata::block::{Block, Header as BlockHeader, Version};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
-use bitcoin::{BlockHash, Transaction, TxMerkleNode};
+use bitcoin::{Amount, BlockHash, ScriptBuf, Transaction, TxMerkleNode, TxOut};
 use codec_sv2::{Error as CodecError, NoiseEncoder, StandardNoiseDecoder};
 use common_messages_sv2::{
     Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
@@ -631,14 +631,30 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
     let coinbase_prefix: binary_sv2::B0255<'static> = coinbase_prefix_bytes
         .try_into()
         .map_err(|e| anyhow!("B0255 coinbase_prefix: {:?}", e))?;
-    let coinbase_tx_outputs: binary_sv2::B064K<'static> = Vec::new()
+    let (coinbase_tx_outputs_count, coinbase_tx_outputs_bytes, witness_commitment_included) =
+        if let Some(default_witness_commitment) = tmpl.default_witness_commitment.as_deref() {
+            let script_pubkey = ScriptBuf::from_bytes(
+                hex::decode(default_witness_commitment.trim())
+                    .with_context(|| "hex-decode default_witness_commitment")?,
+            );
+            let coinbase_tx_out = TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey,
+            };
+            (1, serialize(&coinbase_tx_out), true)
+        } else {
+            (0, Vec::new(), false)
+        };
+    let coinbase_tx_outputs: binary_sv2::B064K<'static> = coinbase_tx_outputs_bytes
         .try_into()
-        .map_err(|e| anyhow!("B064K empty: {:?}", e))?;
+        .map_err(|e| anyhow!("B064K coinbase_tx_outputs: {:?}", e))?;
 
     info!(
         peer = %peer,
         template_id,
         height = tmpl.height,
+        witness_commitment_included,
+        coinbase_tx_outputs_count,
         coinbase_prefix_hex = %coinbase_prefix_hex,
         "send_template_pair: built NewTemplate coinbase_prefix"
     );
@@ -651,7 +667,7 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         coinbase_prefix,
         coinbase_tx_input_sequence: 0xffff_ffff,
         coinbase_tx_value_remaining: tmpl.coinbase_value,
-        coinbase_tx_outputs_count: 0,
+        coinbase_tx_outputs_count,
         coinbase_tx_outputs,
         coinbase_tx_locktime: 0,
         merkle_path,

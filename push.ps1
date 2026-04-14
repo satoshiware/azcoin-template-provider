@@ -1,11 +1,10 @@
 git status
 git add -A
-git commit -m "Bug fixes and stale block error fixes to v0.1.5"   
-git tag v0.1.5
+git commit -m "v0.1.6: fixed coinbase height bug and unexpected-witness bug"
+git tag v0.1.6
 git push origin main
-git push origin v0.1.5
+git push origin v0.1.6
 
 $SHA = (git rev-parse --short HEAD).Trim()
 
-# Build once, tag many (v0.1.4 + stable + sha; optionally latest)
-$SHA = (git rev-parse --short HEAD).Trim()
+# fixed coinbase height bug and unexpected-witness bug

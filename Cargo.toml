@@ -1,6 +1,6 @@
 [package]
 name = "azcoin-template-provider"
-version = "0.1.0"
+version = "0.1.6"
 edition = "2021"
 description = "RPC adapter for azcoind block templates (SV2 Template Provider — RPC-only phase)"
 
