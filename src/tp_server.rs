@@ -543,6 +543,31 @@ async fn wait_for_template(rx: &mut watch::Receiver<Option<AzcoinTemplate>>) -> 
     }
 }
 
+fn encode_bip34_height_prefix(height: u64) -> Result<Vec<u8>> {
+    let mut encoded_height = Vec::new();
+    let mut value = u32::try_from(height)
+        .map_err(|_| anyhow!("template height {} exceeds BIP34 helper range", height))?;
+    while value > 0 {
+        encoded_height.push((value & 0xff) as u8);
+        value >>= 8;
+    }
+    if encoded_height
+        .last()
+        .map(|byte| byte & 0x80 != 0)
+        .unwrap_or(false)
+    {
+        encoded_height.push(0x00);
+    }
+
+    let mut prefix = Vec::with_capacity(encoded_height.len() + 1);
+    prefix.push(
+        u8::try_from(encoded_height.len())
+            .map_err(|_| anyhow!("encoded BIP34 height length does not fit in push opcode"))?,
+    );
+    prefix.extend_from_slice(&encoded_height);
+    Ok(prefix)
+}
+
 /// Build and send `NewTemplate` then `SetNewPrevHash` for `tmpl` (ordering preserved).
 async fn send_template_pair<W: AsyncWrite + Unpin>(
     stream: &mut W,
@@ -601,12 +626,22 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         .try_into()
         .map_err(|e| anyhow!("merkle Seq0255: {:?}", e))?;
 
-    let coinbase_prefix: binary_sv2::B0255<'static> = Vec::new()
+    let coinbase_prefix_bytes = encode_bip34_height_prefix(tmpl.height)?;
+    let coinbase_prefix_hex = hex::encode(&coinbase_prefix_bytes);
+    let coinbase_prefix: binary_sv2::B0255<'static> = coinbase_prefix_bytes
         .try_into()
-        .map_err(|e| anyhow!("B0255 empty: {:?}", e))?;
+        .map_err(|e| anyhow!("B0255 coinbase_prefix: {:?}", e))?;
     let coinbase_tx_outputs: binary_sv2::B064K<'static> = Vec::new()
         .try_into()
         .map_err(|e| anyhow!("B064K empty: {:?}", e))?;
+
+    info!(
+        peer = %peer,
+        template_id,
+        height = tmpl.height,
+        coinbase_prefix_hex = %coinbase_prefix_hex,
+        "send_template_pair: built NewTemplate coinbase_prefix"
+    );
 
     let new_t = NewTemplate {
         template_id,
