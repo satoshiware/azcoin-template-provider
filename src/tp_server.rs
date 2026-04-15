@@ -1146,41 +1146,84 @@ async fn drain_encrypted_frames_with_live_updates(
                         prev_hash = %payload.template.previous_block_hash,
                         "SV2 live template writer: received broadcast payload (recv Ok)"
                     );
+                    let first_template_id = payload.template.height.max(1);
+                    let first_height = payload.template.height;
+                    let mut latest_payload = payload;
+                    let mut drained_after_first = 0u64;
+                    let mut exit_after_send = false;
+                    loop {
+                        match upd_rx.try_recv() {
+                            Ok(payload) => {
+                                drained_after_first += 1;
+                                latest_payload = payload;
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                                warn!(
+                                    peer = %peer_w,
+                                    skipped,
+                                    "SV2 template update receiver lagged"
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                                exit_after_send = true;
+                                break;
+                            }
+                        }
+                    }
+                    let latest_template_id = latest_payload.template.height.max(1);
                     info!(
                         peer = %peer_w,
-                        height = payload.template.height,
-                        prev_hash = %payload.template.previous_block_hash,
+                        first_template_id,
+                        first_height,
+                        latest_template_id,
+                        latest_height = latest_payload.template.height,
+                        skipped_intermediate = drained_after_first.saturating_sub(1),
+                        "SV2 live writer: coalesced queued template updates"
+                    );
+                    info!(
+                        peer = %peer_w,
+                        height = latest_payload.template.height,
+                        prev_hash = %latest_payload.template.previous_block_hash,
                         "Template update dequeued for SV2 session"
                     );
                     info!(
                         peer = %peer_w,
-                        height = payload.template.height,
+                        height = latest_payload.template.height,
                         "SV2 live writer: requesting codec state Mutex lock"
                     );
                     let mut g = w_state.lock().await;
                     info!(
                         peer = %peer_w,
-                        height = payload.template.height,
+                        height = latest_payload.template.height,
                         "SV2 live writer: acquired codec state Mutex lock"
                     );
                     info!(
                         peer = %peer_w,
-                        height = payload.template.height,
+                        height = latest_payload.template.height,
                         "SV2 live writer: calling send_template_pair"
                     );
-                    match send_template_pair(&mut wh, &mut *g, &payload.template, peer_w).await {
+                    match send_template_pair(&mut wh, &mut *g, &latest_payload.template, peer_w).await {
                         Ok(()) => {
-                            insert_template_id_cache(&tc_writer, &payload.template);
+                            insert_template_id_cache(&tc_writer, &latest_payload.template);
                             info!(
                                 peer = %peer_w,
-                                height = payload.template.height,
+                                height = latest_payload.template.height,
                                 "SV2 live writer: send_template_pair completed Ok"
                             );
+                            if exit_after_send {
+                                info!(
+                                    peer = %peer_w,
+                                    reason = "broadcast_closed",
+                                    "SV2 live template writer task: recv loop exiting"
+                                );
+                                break;
+                            }
                         }
                         Err(e) => {
                             error!(
                                 peer = %peer_w,
-                                height = payload.template.height,
+                                height = latest_payload.template.height,
                                 error = %e,
                                 error_debug = ?e,
                                 "SV2 live writer: send_template_pair returned error (full error)"
@@ -1193,7 +1236,7 @@ async fn drain_encrypted_frames_with_live_updates(
                             info!(
                                 peer = %peer_w,
                                 reason = "send_template_pair_error_after_live_payload",
-                                height = payload.template.height,
+                                height = latest_payload.template.height,
                                 "SV2 live template writer task: recv loop exiting"
                             );
                             break;
