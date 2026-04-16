@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::rpc::RpcClient;
@@ -1126,17 +1126,17 @@ async fn drain_encrypted_frames_with_live_updates(
     template_rx: watch::Receiver<Option<AzcoinTemplate>>,
     template_cache: TemplateIdCache,
 ) -> Result<()> {
-    let state = Arc::new(Mutex::new(transport_state));
-    let w_state = Arc::clone(&state);
+    let mut read_transport_state = transport_state.clone();
     let peer_w = peer;
     let tc_writer = template_cache.clone();
 
     tokio::spawn(async move {
         info!(
             peer = %peer_w,
-            "SV2 live template writer task started"
+            "SV2 live template writer task started with dedicated write codec state"
         );
         let mut wh = write_half;
+        let mut write_transport_state = transport_state;
         loop {
             match upd_rx.recv().await {
                 Ok(payload) => {
@@ -1190,20 +1190,21 @@ async fn drain_encrypted_frames_with_live_updates(
                     info!(
                         peer = %peer_w,
                         height = latest_payload.template.height,
-                        "SV2 live writer: requesting codec state Mutex lock"
-                    );
-                    let mut g = w_state.lock().await;
-                    info!(
-                        peer = %peer_w,
-                        height = latest_payload.template.height,
-                        "SV2 live writer: acquired codec state Mutex lock"
+                        "SV2 live writer: using dedicated write codec state"
                     );
                     info!(
                         peer = %peer_w,
                         height = latest_payload.template.height,
                         "SV2 live writer: calling send_template_pair"
                     );
-                    match send_template_pair(&mut wh, &mut *g, &latest_payload.template, peer_w).await {
+                    match send_template_pair(
+                        &mut wh,
+                        &mut write_transport_state,
+                        &latest_payload.template,
+                        peer_w,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             insert_template_id_cache(&tc_writer, &latest_payload.template);
                             info!(
@@ -1266,13 +1267,15 @@ async fn drain_encrypted_frames_with_live_updates(
         );
     });
 
-    info!(peer = %peer, "Session read loop with live template push (post-SetupConnection)");
+    info!(
+        peer = %peer,
+        "Session read loop with live template push (post-SetupConnection); using dedicated read codec state"
+    );
 
     loop {
-        let frame_result = {
-            let mut g = state.lock().await;
-            read_encrypted_sv2_frame(&mut read_half, decoder, &mut *g, peer).await
-        };
+        let frame_result =
+            read_encrypted_sv2_frame(&mut read_half, decoder, &mut read_transport_state, peer)
+                .await;
         match frame_result {
             Ok((h, payload, cipher_len)) => {
                 log_and_dispatch_post_init_sv2_frame(
