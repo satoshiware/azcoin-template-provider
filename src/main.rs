@@ -12,6 +12,8 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
 
+const TEMPLATE_BROADCAST_BUFFER_DEPTH: usize = 512;
+
 #[derive(Parser)]
 #[command(name = "azcoin-template-provider")]
 #[command(version, about = "RPC adapter for azcoind block templates")]
@@ -59,7 +61,13 @@ async fn main() -> Result<()> {
 
     let (template_tx, template_rx) = tokio::sync::watch::channel(None);
     let (template_push_tx, _) =
-        tokio::sync::broadcast::channel::<crate::template::TemplateUpdatePayload>(64);
+        tokio::sync::broadcast::channel::<crate::template::TemplateUpdatePayload>(
+            TEMPLATE_BROADCAST_BUFFER_DEPTH,
+        );
+    info!(
+        template_broadcast_buffer_depth = TEMPLATE_BROADCAST_BUFFER_DEPTH,
+        "Template broadcast buffer configured"
+    );
 
     let keys_configured =
         !cfg.authority_public_key.is_empty() && !cfg.authority_secret_key.is_empty();
