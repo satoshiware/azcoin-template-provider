@@ -8,6 +8,8 @@
 #      config/azcoin-template-provider.toml
 #
 # The service reads this file at startup (override with --config <path>).
+#
+# See README.md for the 0.2.0 operational baseline (SV2 live templates + SubmitSolution).
 
 # ----------------------------------------------------------------------------
 # RPC connection

@@ -5,8 +5,12 @@
 //! previous template.  Changes are logged at `INFO`; identical templates are
 //! logged at `DEBUG`.
 //!
-//! Each new template is also published through a [`tokio::sync::watch`]
-//! channel so the TP server can read the latest template at any time.
+//! Each new template is published through a [`tokio::sync::watch`] channel so
+//! [`crate::tp_server`] always has the latest snapshot. **On meaningful change**
+//! (see [`AzcoinTemplate::describe_change()`][crate::template::AzcoinTemplate::describe_change]),
+//! the same template is also sent on a [`tokio::sync::broadcast`] channel so
+//! connected SV2 sessions can roll forward with `NewTemplate` + `SetNewPrevHash`
+//! (release **`0.2.0`** behavior).
 //!
 //! The loop is resilient — a single failed RPC call logs an error and retries
 //! on the next tick without crashing the service.

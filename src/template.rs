@@ -1,5 +1,8 @@
 //! Block template types and change-detection logic.
 //!
+//! `default_witness_commitment` (when present) flows into SV2 `NewTemplate` placeholder outputs in
+//! [`crate::tp_server`] (**0.2.0**).
+//!
 //! This module defines two layers of types:
 //!
 //! 1. **`Rpc*` structs** — raw JSON-RPC response shapes that mirror exactly

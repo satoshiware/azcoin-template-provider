@@ -12,11 +12,13 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
 
+/// Capacity for `tokio::sync::broadcast` used to push live template updates to SV2 sessions.
+/// Larger depth reduces `RecvError::Lagged` / drops when many templates arrive in a burst (0.2.0).
 const TEMPLATE_BROADCAST_BUFFER_DEPTH: usize = 512;
 
 #[derive(Parser)]
 #[command(name = "azcoin-template-provider")]
-#[command(version, about = "RPC adapter for azcoind block templates")]
+#[command(version, about = "AZCOIN SV2 Template Provider — GBT polling, live templates, SubmitSolution → submitblock")]
 struct Cli {
     /// Path to TOML configuration file.
     #[arg(

@@ -1,8 +1,8 @@
 [package]
 name = "azcoin-template-provider"
-version = "0.1.7-r1"
+version = "0.2.0"
 edition = "2021"
-description = "RPC adapter for azcoind block templates (SV2 Template Provider — RPC-only phase)"
+description = "AZCOIN SV2 Template Provider — getblocktemplate polling, live SV2 template distribution, SubmitSolution → submitblock"
 
 [dependencies]
 anyhow = "1"

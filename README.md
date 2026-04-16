@@ -1,310 +1,274 @@
-# azcoin-template-provider
+# azcoin-template-provider **0.2.0**
 
-Rust service that sits between `azcoind` and an SV2 mining pool.
-It polls `azcoind` for block templates over JSON-RPC and exposes a
-Noise-authenticated TCP listener where `pool_sv2` connects.  After the
-Noise NX handshake, the listener completes `SetupConnection` as a **common message**
-(`extension_type = 0`), checks `SetupConnection.protocol` for Template Distribution, and replies
-with `SetupConnectionSuccess` (or `SetupConnectionError`).  It then handles the **first** Template
-Distribution frame from the pool (`CoinbaseOutputConstraints`, `msg_type` **112 / 0x70**), and
-sends **`NewTemplate`** then **`SetNewPrevHash`** built from the latest cached
-`getblocktemplate` snapshot so the pool can leave its “waiting for initial template and prevhash”
-state.  Further SV2 messages are only decrypted and logged by header.
+Stable baseline for the AZCOIN Stratum V2 mining path. This service sits between `azcoind` and `pool_sv2`: it polls the node for block templates, converts them into SV2 Template Distribution messages, pushes fresh work to the pool, accepts `SubmitSolution` when a block is found, assembles the full block, and submits it via `submitblock`.
 
-## Project Structure
+**Release 0.2.0** is the first clean baseline where live template delivery, block submission, and on-chain reward crediting have been proven end to end. This document matches crate version **0.2.0** (`Cargo.toml`).
+
+---
+
+## Goal
+
+- Poll `azcoind` for fresh block templates (`getblocktemplate`).
+- Convert templates into SV2 Template Distribution messages (`NewTemplate`, `SetNewPrevHash`).
+- Push fresh work to `pool_sv2` on an ongoing basis (live roll-forward).
+- Receive `SubmitSolution` from the pool, assemble full block hex, call `submitblock` on `azcoind`.
+- Cache templates by SV2 `template_id` so solved blocks reconstruct against the correct snapshot.
+
+---
+
+## Scope of 0.2.0
+
+### Included
+
+- `getblocktemplate` polling from the AZCoin node RPC.
+- Initial SV2 template distribution after `SetupConnection` + `CoinbaseOutputConstraints`.
+- Live SV2 template roll-forward when the poller detects meaningful template changes.
+- `SubmitSolution` (message type **118** / `0x76`) decode and handling.
+- Full block assembly from solved template + coinbase, then `submitblock`.
+- Template-id cache for solved-template lookup (bounded LRU-style by height key).
+- BIP34 coinbase height prefix in `NewTemplate.coinbase_prefix`.
+- Witness commitment output in `NewTemplate` when `default_witness_commitment` is present.
+- Dedicated read vs write `codec_sv2::State` so the live template writer is not starved by the session read loop.
+- Deeper broadcast buffer for bursty template updates (see `TEMPLATE_BROADCAST_BUFFER_DEPTH` in `main.rs`).
+- Structured logs for template push, submit flow, and node acceptance/rejection.
+
+### Not included (by design)
+
+- Per-miner payout accounting or worker-level share ledger.
+- Payout transaction creation or pool-side credit balances.
+- Dashboard/API as authoritative truth for miner connection state.
+- Broad protocol redesign beyond the narrow Template Provider role.
+
+---
+
+## High-level architecture
+
+```text
+azcoind
+  └─ RPC: getblocktemplate / submitblock
+       │
+       ▼
+azcoin-template-provider
+  ├─ poller: watches for new templates, broadcasts meaningful changes
+  ├─ SV2 TP server: Noise + SetupConnection + Template Distribution
+  └─ SubmitSolution handler: assembles full block, calls submitblock
+       │
+       ▼
+pool_sv2
+  ├─ receives template updates
+  ├─ distributes work downstream
+  ├─ accepts shares
+  └─ sends SubmitSolution on block find
+       │
+       ▼
+translator / miners
+```
+
+**Repository layout:**
 
 ```
 azcoin-template-provider/
-├── Cargo.toml                                  # crate manifest & dependencies
-├── config/
-│   └── azcoin-template-provider.toml.example   # annotated reference config
+├── Cargo.toml
+├── config/azcoin-template-provider.toml.example
 ├── src/
-│   ├── main.rs       # entry point — CLI parsing, wiring, startup sequence
-│   ├── config.rs     # TOML config loading & validation
-│   ├── rpc.rs        # JSON-RPC 1.0 client (reqwest + Basic auth)
-│   ├── template.rs   # RPC response types, AzcoinTemplate, change detection
-│   ├── poller.rs     # async polling loop (publishes via watch channel)
-│   ├── health.rs     # startup connectivity & network-match check
-│   └── tp_server.rs  # SV2 TP: Noise + SetupConnection + minimal Template Distribution
-├── testdata/
-│   └── getblocktemplate_regtest.json   # fixture for deserialization tests
+│   ├── main.rs       # CLI, wiring, template broadcast depth
+│   ├── config.rs     # TOML load & validation
+│   ├── rpc.rs        # JSON-RPC client (incl. submitblock)
+│   ├── template.rs   # RPC types, AzcoinTemplate, change detection
+│   ├── poller.rs     # getblocktemplate loop → watch + broadcast
+│   ├── health.rs     # startup connectivity & network match
+│   └── tp_server.rs  # Noise, SV2 TD, live push, SubmitSolution
+├── testdata/getblocktemplate_regtest.json
 └── README.md
 ```
 
-## Architecture
+Typical deployment paths (adjust for your host):
 
-```
-                           ┌─────────────────────────────────────┐
-┌────────────┐  JSON-RPC   │  azcoin-template-provider           │
-│  azcoind   │◄────────────│                                     │   Noise :8442
-│  (node)    │────────────►│  poller ──watch──► tp_server ◄──────── pool_sv2
-└────────────┘             │            channel  (Noise NX)      │
-                           │                                     │
-                           │  startup:                           │
-                           │    config.rs  → load TOML           │
-                           │    health.rs  → getblockchaininfo   │
-                           │                                     │
-                           │  concurrent tasks:                  │
-                           │    poller.rs  → getblocktemplate    │
-                           │    tp_server  → Noise + Setup + initial TD │
-                           └─────────────────────────────────────┘
-```
+| Piece | Example path |
+|-------|----------------|
+| This repo | `~/repos/azcoin-template-provider` |
+| Pool (`pool_sv2`) | e.g. under your `sv2-apps` checkout |
+| Pool config | e.g. `/etc/azcoin-super/pool/pool-config.toml` |
+| Node | `azcoind` with `azcoin.conf` and datadir |
 
-**Data flow (per poll tick):**
+---
 
-1. `poller` calls `rpc.get_block_template()`.
-2. `rpc` sends a JSON-RPC 1.0 POST to `azcoind` and deserializes the
-   response into `RpcBlockTemplate`.
-3. `template::AzcoinTemplate::from_rpc()` normalizes the raw data.
-4. `template::AzcoinTemplate::describe_change()` compares against the
-   previous template and returns a human-readable diff (or `None`).
-5. The result is logged via `tracing` at the appropriate level.
-6. The template is published through a `tokio::sync::watch` channel so
-   `tp_server` always has access to the latest template.
+## Proven runtime behavior (0.2.0)
 
-## Current Scope
+- Pool receives live `NewTemplate` and `SetNewPrevHash`.
+- Pool sends `SubmitSolution` on found block.
+- Template Provider decodes `SubmitSolution`, resolves template via cache, assembles block.
+- `azcoind` accepts the block via `submitblock` (null result).
+- Accepted blocks land on-chain; rewards credit to the payout path configured in pool/node policy (immature coinbase outputs in the operator wallet is the common deployment pattern).
 
-- Load configuration from a TOML file (`rpc_url`, `rpc_user`,
-  `rpc_password`, `poll_interval_ms`, `network`, `template_rules`,
-  `tp_listen_address`, `authority_public_key`, `authority_secret_key`).
-- Connect to `azcoind` and verify connectivity via `getblockchaininfo`.
-- Poll `getblocktemplate` on a configurable interval.
-- Detect and log **template changes** (see below).
-- Expose helper RPC wrappers: `getblockchaininfo`, `getblocktemplate`,
-  `submitblock`, `getbestblockhash`, `getblockheader`.
-- **SV2 TP (Noise + SetupConnection + initial Template Distribution)**:
-  Bind on `tp_listen_address`, run Noise NX, then handle `SetupConnection`
-  as above (common messages on extension **0**, Template Distribution in
-  the payload, version **2**).  After `SetupConnectionSuccess`, read the next
-  encrypted frame with the same **common** framing (`extension_type == 0`,
-  `channel_msg == false`), then recognize Template Distribution by
-  **`msg_type`** (`CoinbaseOutputConstraints` /
-  `MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS`, decimal **112**).  Decode it,
-  take the latest `AzcoinTemplate` from the
-  `watch` channel, and send **`NewTemplate`** (merkle path from template tx
-  `data` hex + placeholder coinbase leaf) then **`SetNewPrevHash`** (prev
-  hash, `nBits`, target, timestamp from the template).  Any further frames
-  are decrypted and logged by header only; their payloads are not handled.
-- Share the latest polled template in-process via a `watch` channel
-  (used for the initial `NewTemplate` / `SetNewPrevHash` pair).
-- Graceful fallback to poller-only mode when authority keys are not
-  configured.
+**What 0.2.0 does not prove:** per-miner accounting, authoritative worker ledgers, or a payout engine — build those as separate services.
 
-## Non-Goals (for this phase)
+---
 
-- Ongoing Template Distribution after the first exchange: no push of
-  updated templates on every poll, no handling of `RequestTransactionData`,
-  no `SubmitSolution`, no re-announcement when the mempool changes.
-- Solved-block submission relay (RPC `submitblock` exists but is not wired
-  to SV2 submission flows).
-- Translator proxy integration.
-- Block assembly or coinbase construction.
-- systemd / Docker packaging.
-- Metrics, Prometheus, or HTTP health endpoints.
-- Persistent storage.
-- Workspace-level Cargo changes.
+## Critical fixes that define the clean baseline
 
-## SV2 Template Provider (Noise + SetupConnection + initial Template Distribution)
+1. **`SubmitSolution`** — Post-setup frames with `msg_type == 118` are decoded and routed to block assembly + `submitblock`.
+2. **Template-id cache** — Solved blocks use the cached GBT snapshot for the submitted `template_id`, not only the latest template.
+3. **BIP34 height** — `coinbase_prefix` carries correct BIP34-encoded block height for `NewTemplate`.
+4. **Witness commitment** — When `default_witness_commitment` is set, the placeholder coinbase includes the zero-value witness-commitment output.
+5. **Dedicated read/write codec state** — After init, the TCP stream splits: one task owns the write path and its own `codec_sv2::State`; the read loop keeps a clone for decrypting inbound frames. This removed starvation where the writer blocked behind the reader so the pool mined stale work.
+6. **Broadcast depth** — Larger `broadcast` capacity reduces drops during bursty template updates (watch for `SV2 template update receiver lagged` if the system is overloaded).
 
-The `tp_server` module (`src/tp_server.rs`) uses the same stack as the
-Stratum V2 reference crates: `noise_sv2` for the NX handshake,
-`codec_sv2` (with `noise_sv2` feature) for encrypted SV2 framing,
-`common_messages_sv2` for `SetupConnection` / success / error, and
-`template_distribution_sv2` for the first TD messages.
+### Why the read/write split mattered
 
-**What works now:**
-- TCP bind on the configured `tp_listen_address` (default `0.0.0.0:8442`)
-- Full Noise NX handshake per connection (responder)
-- First encrypted SV2 frame: decrypt, **frame-level** checks (`msg_type` =
-  `SetupConnection`, `extension_type == 0`, `channel_msg == false`), then
-  decode body and **payload-level** check `protocol ==` Template
-  Distribution; log both stages distinctly
-- Negotiate protocol version **2** only; reply with
-  `SetupConnectionSuccess { used_version, flags: 0 }` or
-  `SetupConnectionError` (`unsupported-protocol`, `protocol-version-mismatch`)
-- **Inbound (Template Distribution):** **frame-level** accept the first
-  post-success frame when `extension_type == 0` and `channel_msg == false`
-  (same as common messages); **dispatch** by `msg_type` — decode
-  `CoinbaseOutputConstraints` when `msg_type == 112` (**0x70**,
-  `MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS`)
-- **Outbound (Template Distribution):** send **`NewTemplate`** then
-  **`SetNewPrevHash`** with **`extension_type == 0`** and **`channel_msg == false`**
-  (aligned with inbound TD framing and `pool_sv2`’s protocol classifier — not
-  subprotocol discriminant **2** on the wire).  Payloads use the latest
-  `AzcoinTemplate` from the poller (`template_id` = `height.max(1)`; merkle path
-  from GBT transaction `data` hex; empty coinbase prefix/outputs placeholder;
-  `future_template: true`).
-- Logging: frame-level acceptance vs TD dispatch by `msg_type`, decoded
-  constraints; each outbound TD
-  `msg_type` / label; summary with template height and RPC prev-hash string
-- After that pair: keep reading encrypted frames, decrypt with the same
-  session, log `msg_type` / extension / payload length (payload not parsed)
-- Graceful EOF handling on the idle read loop
-- Graceful fallback: empty authority keys → poller-only mode
+Unhealthy pattern (older builds): new templates were discovered quickly, but the writer shared one mutex-protected codec with the read loop → writer blocked behind reads → pool stayed on old template IDs → stale or side-chain blocks.
 
-**What is explicitly NOT implemented:**
-- `RequestTransactionData` / transaction data responses
-- `SubmitSolution` or any solved-block path over SV2
-- Pushing a **new** `NewTemplate` + `SetNewPrevHash` when the poller sees a
-  template change (only the initial pair after setup)
-- Applying `CoinbaseOutputConstraints` to coinbase layout (message is only
-  decoded and logged)
-- Parsing post-initial TD frames beyond header logging
+Healthy signals after the fix: `skipped_intermediate` at or near **0** during normal roll-forward, no repeated `SV2 template update receiver lagged`, `submitblock: node accepted block` on current work.
 
-## AZCOIN-Specific Compatibility
+---
 
-This adapter targets **AZCOIN** (`azcoind`), a Bitcoin Core derivative.
-The following design decisions ensure compatibility:
+## Data flow (implementation)
 
-| Area | Assumption |
-|---|---|
-| **SegWit** | Not assumed.  `getblocktemplate` sends an empty object `{}` by default — no `"rules": ["segwit"]` unless explicitly configured via `template_rules`. |
-| **Chain name** | The `network` config value is matched against the `chain` field returned by `getblockchaininfo`.  No hardcoded allowlist — any value the node reports is accepted. |
-| **RPC schema** | Response structs use `#[serde(default)]` for every field that may be absent on AZCOIN (e.g. `weightlimit`, `default_witness_commitment`, `hash` on transactions).  Required fields are those present in every Bitcoin Core derivative: `version`, `previousblockhash`, `transactions`, `coinbasevalue`, `target`, `bits`, `height`, `curtime`, `mintime`. |
-| **`submitblock`** | Returns `None` (accepted) or `Some("reason")` (rejected), matching Bitcoin Core conventions. |
+1. **`poller`** calls `getblocktemplate`, builds [`AzcoinTemplate`](src/template.rs), updates a `watch` channel, and on meaningful change sends [`TemplateUpdatePayload`](src/template.rs) on a `broadcast` channel for live SV2 pushes.
+2. **`tp_server`** completes Noise NX, `SetupConnection` (Template Distribution, protocol version 2), reads `CoinbaseOutputConstraints`, sends initial `NewTemplate` + `SetNewPrevHash`, then runs a read loop plus a writer task subscribed to template broadcasts.
+3. **Inbound `SubmitSolution`** — Parsed in `log_and_dispatch_post_init_sv2_frame`; block bytes built in `block_bytes_from_submit_solution`; submitted with [`RpcClient::submit_block`](src/rpc.rs).
 
-### What if AZCOIN diverges further from Bitcoin Core RPC?
+Framing note: outbound Template Distribution uses **`extension_type == 0`** and **`channel_msg == false`**, consistent with common-message framing and typical `pool_sv2` classifiers.
 
-If `azcoind` adds or renames fields not yet covered, update the
-`Rpc*` structs in `src/template.rs` and add a new JSON fixture in
-`testdata/`.  All existing tests will keep passing because unknown
-fields are silently ignored by serde.
+---
 
-## What "Template Changed" Means
-
-The poller compares each new template against the previous one:
-
-| Change detected | Log message |
-|---|---|
-| `previousblockhash` differs | **"new block"** — a new block was found on the network, so the template now builds on a different tip. |
-| Same `previousblockhash` but transaction set or `coinbasevalue` differs | **"template updated"** — the mempool changed (new transactions arrived or old ones were evicted). |
-| Nothing meaningful differs (only `curtime` changed) | Debug-level "Template unchanged" — no action needed. |
-
-`curtime` changes on every poll because the node advances the block
-timestamp.  This is intentionally **not** treated as a template change
-to avoid log spam.
-
-## Prerequisites
-
-- Rust toolchain (stable, 1.70+)
-- A running `azcoind` node with JSON-RPC enabled
-
-## How to Build
-
-```bash
-cargo build
-```
-
-For a release binary:
-
-```bash
-cargo build --release
-```
-
-## How to Test
-
-```bash
-cargo test
-```
-
-**17 tests** across three modules:
-
-| Module | Tests | What's covered |
-|---|---|---|
-| `config` | 4 | Minimal load, template_rules parsing, validation rejection, custom network names |
-| `rpc` | 4 | `submitblock` result deserialization: null (accepted), "duplicate", "inconclusive", "high-hash" |
-| `template` | 9 | Fixture parsing, missing-witness-field parsing, `from_rpc` field mapping, new-block detection, tx-set update, coinbase-only update, curtime-only (ignored), identical templates |
-
-The test fixture at `testdata/getblocktemplate_regtest.json` is a
-synthetic AZCOIN regtest response (no witness commitment, empty rules).
-Replace it with a real capture from your `azcoind` node for maximum
-fidelity — existing tests will still pass as long as the required fields
-are present.
-
-## Configuration Reference
+## Configuration
 
 | Field | Type | Required | Default | Description |
-|---|---|---|---|---|
+|-------|------|----------|---------|-------------|
 | `rpc_url` | string | yes | — | JSON-RPC endpoint, e.g. `http://127.0.0.1:8332` |
 | `rpc_user` | string | yes | — | RPC username |
 | `rpc_password` | string | yes | — | RPC password |
-| `poll_interval_ms` | integer | yes | — | Polling interval in ms (minimum 100) |
+| `poll_interval_ms` | integer | yes | — | Poll interval in ms (minimum 100) |
 | `network` | string | yes | — | Expected chain name from `getblockchaininfo` |
-| `template_rules` | string[] | no | `[]` | BIP rules for `getblocktemplate` request |
-| `tp_listen_address` | string | no | `"0.0.0.0:8442"` | TCP address for the SV2 Noise listener |
-| `authority_public_key` | string | no | `""` | Noise authority public key (64 hex chars). Empty = disable Noise. |
-| `authority_secret_key` | string | no | `""` | Noise authority secret key (64 hex chars). Empty = disable Noise. |
+| `template_rules` | string[] | no | `[]` | BIP rules for `getblocktemplate` |
+| `tp_listen_address` | string | no | `0.0.0.0:8442` | TCP for SV2 Noise listener |
+| `authority_public_key` | string | no | `""` | Noise authority public key (64 hex); empty disables SV2 |
+| `authority_secret_key` | string | no | `""` | Noise authority secret key (64 hex) |
 
-See `config/azcoin-template-provider.toml.example` for a fully-commented
-reference file.
-
-## How to Configure
+Copy and edit the example file:
 
 ```bash
 cp config/azcoin-template-provider.toml.example config/azcoin-template-provider.toml
-# Edit the file to match your azcoind setup
 ```
 
-> **Tip:** Add `config/azcoin-template-provider.toml` to your
-> `.gitignore` so local credentials are never committed.
+Add `config/azcoin-template-provider.toml` to `.gitignore` if it holds secrets.
 
-## How to Run
+---
+
+## Build, test, run
 
 ```bash
-# Uses the default config path (config/azcoin-template-provider.toml)
+cargo build --release
+cargo test    # 17 unit tests (config, rpc submitblock results, template change detection, fixtures)
+```
+
+```bash
 cargo run
-
-# Or specify a custom config file
+# or
 cargo run -- --config /path/to/config.toml
-
-# Increase log verbosity
 RUST_LOG=debug cargo run
 ```
 
-### Example Output
+If authority keys are empty, the service runs **poller-only** (no SV2 listener).
 
-```
-INFO  Loading configuration    path="config/azcoin-template-provider.toml"
-INFO  Configuration loaded     rpc_url="http://127.0.0.1:8332" network="regtest" poll_ms=1000 tp_addr="0.0.0.0:8442"
-INFO  Connecting to azcoind    url="http://127.0.0.1:8332"
-INFO  RPC connection established  chain="regtest" blocks=200 headers=200 best_hash="7e4b..." ibd=false sync="100.0000%"
-INFO  Health check passed      network="regtest" template_rules=[]
-INFO  Starting SV2 Template Provider (Noise-authenticated)  tp_address="0.0.0.0:8442"
-INFO  SV2 Template Provider listening (Noise-authenticated)  address=0.0.0.0:8442
-INFO  Starting template poller interval_ms=1000
-INFO  Initial template received  poll=1 height=201 prev_hash="7e4bac91..." tx_count=2 coinbase=5000037500
-INFO  Incoming TCP connection  peer=192.168.1.50:54321
-INFO  Noise handshake: waiting for initiator ephemeral key  peer=192.168.1.50:54321
-INFO  Noise handshake: computing response  peer=192.168.1.50:54321
-INFO  Noise handshake completed — encrypted transport established  peer=192.168.1.50:54321
-INFO  SV2 application: waiting for first encrypted frame  peer=192.168.1.50:54321
-INFO  Raw frame: first post-Noise ciphertext assembled and decrypted...  peer=... cipher_bytes=... msg_type=0 extension_type=0 ...
-INFO  Frame-level validation passed (SetupConnection, extension_type=0, channel_msg=false)  peer=...
-INFO  Decoded SetupConnection body  peer=... setup="SetupConnection(protocol: 2, ..."
-INFO  Payload-level validation passed (SetupConnection.protocol = Template Distribution)  peer=...
-INFO  Response sent: SetupConnectionSuccess (common-message frame; template distribution negotiated in payload)  peer=... used_version=2 extension_type=0
-INFO  Waiting for first Template Distribution message after SetupConnectionSuccess  peer=...
-INFO  Inbound frame (post-SetupConnection)  peer=... msg_type=112 extension_type=0 channel_msg=false ...
-INFO  Frame-level acceptance: post-SetupConnection frame (common extension, non-channel)  peer=...
-INFO  TD dispatch by msg_type: CoinbaseOutputConstraints  peer=...
-INFO  Decoded CoinbaseOutputConstraints payload  peer=... constant="MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS" ...
-INFO  Outbound Template Distribution message sent  peer=... msg_type=... extension_type=0 label="NewTemplate" ...
-INFO  Outbound Template Distribution message sent  peer=... msg_type=... extension_type=0 label="SetNewPrevHash" ...
-INFO  Initial template + prevhash sent to pool  peer=... template_id=... height=... prev_hash_rpc_hex="..."
-INFO  Session idle read loop (post-SetupConnection; payloads not decoded)  peer=...
-INFO  Template changed: new block: height 201 -> 202, prev_hash aabb0011..44556677
-INFO  SV2 client disconnected  peer=192.168.1.50:54321
+---
+
+## Key logs (production)
+
+**Pool — block and template flow:**
+
+```bash
+sudo journalctl -u pool-sv2.service -f -n 0 --no-pager | \
+  grep -Ei 'Block Found|Propagating solution|Received: NewTemplate|Received: SetNewPrevHash|valid share|UpdateChannel'
 ```
 
-### Troubleshooting
+**Template Provider — submit and lag:**
+
+```bash
+sudo journalctl -u azcoin-template-provider.service -f -n 0 --no-pager | \
+  grep -Ei 'SubmitSolution|calling submitblock|submitblock:|skipped_intermediate|SV2 template update receiver lagged|dedicated (read|write) codec state'
+```
+
+**Quick retro — missed found blocks:**
+
+```bash
+sudo journalctl -u pool-sv2.service --since '30 minutes ago' --no-pager | \
+  grep -Ei 'Block Found|Propagating solution'
+```
+
+### Healthy checklist
+
+- Pool receives fresh `NewTemplate` / `SetNewPrevHash`.
+- `SubmitSolution decode succeeded` → `calling submitblock RPC` → `submitblock: node accepted block (null result)`.
+- `skipped_intermediate` ≈ 0; few or no `SV2 template update receiver lagged`.
+- Wallet shows expected immature coinbase growth after accepted blocks (per your payout setup).
+
+---
+
+## Reward routing (operational truth)
+
+Coinbase pays the addresses encoded by pool/template rules in your deployment. **Template Provider 0.2.0 does not implement per-miner payout splits** — the operator or pool layer must add share accounting, balances, and payout policy separately.
+
+---
+
+## Example verification (RPC)
+
+```bash
+azc -rpcwallet=wallet getbalances
+azc -rpcwallet=wallet listtransactions "*" 50 0 true | jq '.[] | select(.generated == true)'
+azc getblock <blockhash> 2
+azc getblockheader <blockhash> true
+azc getchaintips | jq --arg H '<blockhash>' '.[] | select(.hash == $H)'
+```
+
+---
+
+## AZCOIN-specific compatibility
+
+| Area | Behavior |
+|------|----------|
+| **SegWit** | `getblocktemplate` defaults to `{}`; use `template_rules` for `segwit` when the chain supports it. |
+| **Chain name** | `network` in config must match `getblockchaininfo.chain`. |
+| **RPC schema** | Optional fields use `#[serde(default)]` (e.g. `default_witness_commitment`, `weightlimit`). |
+| **`submitblock`** | `None` = accepted, `Some(reason)` = rejected (Bitcoin Core convention). |
+
+If `azcoind` adds fields, extend `Rpc*` types in `src/template.rs` and extend fixtures under `testdata/`.
+
+---
+
+## What “template changed” means
+
+| Change | Log |
+|--------|-----|
+| `previousblockhash` differs | New block on the network — template builds on a new tip. |
+| Same prev hash, tx set or coinbase value differs | Template updated (mempool changed). |
+| Only `curtime` moves | Debug “unchanged” — ignored to reduce noise. |
+
+---
+
+## Troubleshooting
 
 | Symptom | Likely cause | Fix |
-|---|---|---|
-| `HTTP request for RPC method 'getblockchaininfo' failed` | Node is down or `rpc_url` is wrong | Start `azcoind` and verify the URL/port |
-| `RPC 'getblockchaininfo' returned HTTP 401` | Bad credentials | Check `rpc_user` / `rpc_password` match the node config |
-| `network mismatch: config expects 'X' but azcoind reports 'Y'` | Wrong `network` value | Set `network` to the value `azcoind` actually reports |
-| `authority keypair is invalid` | Bad or mismatched hex keys | Generate a valid secp256k1 keypair (see config example) |
-| `authority keys not configured — SV2 TP listener disabled` | Keys are empty | Set `authority_public_key` / `authority_secret_key` in config |
-| `Node is still performing initial block download` | Node is syncing | Wait for sync to complete, or ignore the warning |
-| `RPC 'getblocktemplate' error [-9]` | Node is in IBD | `getblocktemplate` is unavailable during IBD — wait |
-| Repeated `Failed to get block template` | Intermittent RPC issues | The poller retries automatically each tick |
+|---------|----------------|-----|
+| HTTP / RPC errors | Node down or wrong `rpc_url` | Start `azcoind`, verify URL/port |
+| HTTP 401 | Bad credentials | Match `rpc_user` / `rpc_password` |
+| Network mismatch | Wrong `network` | Set to `getblockchaininfo.chain` |
+| Authority key errors | Invalid hex keys | Fix Noise keypair in config |
+| SV2 disabled | Empty authority keys | Set keys or use poller-only mode |
+| `getblocktemplate` [-9] | IBD | Wait for sync |
+| Repeated lag warnings | Bursty templates vs buffer | Tune poll interval / capacity; check node load |
+
+---
+
+## Release statement (0.2.0)
+
+Template Provider **0.2.0** is the stable baseline that demonstrates: stable live template roll-forward, correct solved-template reconstruction, successful `submitblock` acceptance, on-chain blocks, and operator-side reward visibility through normal coinbase flow — **not** a complete payout product.
+
+**Short version:** it sends the right work, receives solved blocks, gets them accepted, and produces real on-chain rewards. Per-miner payout systems are out of scope for this crate.
+
+---
+
+## License
+
+See `LICENSE` in this repository.

@@ -5,6 +5,9 @@
 //! method handles envelope serialization / deserialization and error mapping so
 //! individual wrappers stay one-liners.
 //!
+//! [`submit_block`](RpcClient::submit_block) is used on the **solved-block path**: after the pool
+//! sends SV2 `SubmitSolution`, [`crate::tp_server`] assembles full block bytes and submits them here.
+//!
 //! # Template request rules
 //!
 //! By default, `getblocktemplate` sends an empty request object `{}`.  This is
@@ -129,7 +132,7 @@ impl RpcClient {
     }
 
     /// Fetch a block template from the node.  The `rules` array sent in the
-    /// template request is controlled by [`with_template_rules`].  When empty
+    /// template request is controlled by [`RpcClient::with_template_rules`].  When empty
     /// (the default), an empty object `{}` is sent — compatible with AZCOIN
     /// nodes that have no SegWit soft fork.
     pub async fn get_block_template(&self) -> Result<RpcBlockTemplate> {

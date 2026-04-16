@@ -1,14 +1,32 @@
-//! SV2 Template Provider — Noise, `SetupConnection`, and minimal Template Distribution.
+//! SV2 Template Provider (**0.2.0** baseline): Noise, `SetupConnection`, Template Distribution, live
+//! roll-forward, and `SubmitSolution` → full block → [`crate::rpc::RpcClient::submit_block`].
 //!
-//! After the Noise NX handshake: common-message `SetupConnection` / success or error, then (when the
-//! pool sends [`CoinbaseOutputConstraints`]) outbound [`NewTemplate`] + [`SetNewPrevHash`] built
-//! from the latest [`AzcoinTemplate`] on the watch channel.  Further frames are decrypted and logged
-//! by header only.
+//! # Role in the mining path
+//!
+//! - After Noise NX: common-message [`SetupConnection`] for Template Distribution (protocol version 2).
+//! - Pool sends [`CoinbaseOutputConstraints`]; we reply with [`NewTemplate`] then [`SetNewPrevHash`]
+//!   from the latest [`AzcoinTemplate`].
+//! - Ongoing template updates arrive via `broadcast` (see [`crate::poller`]); a **dedicated writer task**
+//!   with its own [`codec_sv2::State`] sends `NewTemplate`/`SetNewPrevHash` without blocking on the
+//!   **read loop** (which uses a clone of transport state). This split fixed writer starvation where
+//!   the pool mined stale work.
+//! - Inbound [`SubmitSolution`] (`msg_type` **118**) is decoded; `block_bytes_from_submit_solution`
+//!   builds consensus-serialized bytes using the **template-id cache** so the solved block matches the
+//!   GBT snapshot for that template, not only the newest poll.
+//!
+//! # Coinbase / consensus details in `NewTemplate`
+//!
+//! - [`encode_bip34_height_prefix`] — BIP34 height in `coinbase_prefix`.
+//! - When `default_witness_commitment` is present, a zero-value witness-commitment [`TxOut`] is included
+//!   in the placeholder coinbase outputs.
 //!
 //! [`CoinbaseOutputConstraints`]: template_distribution_sv2::CoinbaseOutputConstraints
 //! [`NewTemplate`]: template_distribution_sv2::NewTemplate
 //! [`SetNewPrevHash`]: template_distribution_sv2::SetNewPrevHash
+//! [`SubmitSolution`]: template_distribution_sv2::SubmitSolution
+//! [`SetupConnection`]: common_messages_sv2::SetupConnection
 //! [`AzcoinTemplate`]: crate::template::AzcoinTemplate
+//! [`TxOut`]: bitcoin::blockdata::transaction::TxOut
 
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -543,6 +561,7 @@ async fn wait_for_template(rx: &mut watch::Receiver<Option<AzcoinTemplate>>) -> 
     }
 }
 
+/// BIP34 push of block height, used as the start of `NewTemplate.coinbase_prefix` (SV2 placeholder coinbase).
 fn encode_bip34_height_prefix(height: u64) -> Result<Vec<u8>> {
     let mut encoded_height = Vec::new();
     let mut value = u32::try_from(height)
@@ -832,7 +851,6 @@ where
     Ok(())
 }
 
-/// Consensus-serialized block bytes for [`RpcClient::submitblock`] from pool `SubmitSolution` + GBT snapshot.
 fn decode_bip34_coinbase_height(script_sig: &[u8]) -> Option<u32> {
     let (push_len, prefix_len) = match *script_sig.first()? {
         0x00 => return Some(0),
@@ -869,6 +887,11 @@ fn decode_bip34_coinbase_height(script_sig: &[u8]) -> Option<u32> {
     u32::try_from(value).ok()
 }
 
+/// Builds consensus-encoded block bytes for [`crate::rpc::RpcClient::submit_block`].
+///
+/// Expects `tmpl` to be the cached [`AzcoinTemplate`] for `sol_template_id` (same rule as
+/// `NewTemplate.template_id`: `height.max(1)`). Recomputes merkle root from coinbase + GBT
+/// transactions; header fields come from the solution except merkle root (derived).
 fn block_bytes_from_submit_solution(
     sol_template_id: u64,
     header_version: u32,
@@ -964,6 +987,9 @@ fn block_bytes_from_submit_solution(
     Ok(serialize(&block))
 }
 
+/// Decrypt path dispatch: handles Template Distribution [`SubmitSolution`] (`msg_type` 118) by
+/// resolving `template_id` in the cache, assembling the block, and calling `submitblock`; other
+/// message types are logged only.
 async fn log_and_dispatch_post_init_sv2_frame(
     peer: SocketAddr,
     h: Header,
@@ -1115,6 +1141,9 @@ async fn log_and_dispatch_post_init_sv2_frame(
     );
 }
 
+/// Post-init session: **split TCP** into read vs write halves. The read loop uses `read_transport_state`
+/// (clone of Noise codec state); a spawned task owns `write_transport_state` for live `NewTemplate` /
+/// `SetNewPrevHash` so encoding outbound frames never blocks decryption of inbound `SubmitSolution`.
 async fn drain_encrypted_frames_with_live_updates(
     mut read_half: tokio::net::tcp::OwnedReadHalf,
     write_half: tokio::net::tcp::OwnedWriteHalf,
