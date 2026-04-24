@@ -63,6 +63,19 @@ const TEMPLATE_ID_CACHE_CAP: usize = 32;
 
 type TemplateIdCache = Arc<std::sync::Mutex<HashMap<u64, AzcoinTemplate>>>;
 
+/// Canonical, internal view of SV2 [`CoinbaseOutputConstraints`] for per-session persistence.
+///
+/// Only the two decoded values are kept; this is intentionally not a re-export of the protocol
+/// struct so the validation helper does not leak a lifetime-bound SV2 borrow.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct CoinbaseConstraints {
+    max_additional_size: u32,
+    max_additional_sigops: u16,
+}
+
+/// Per-session persisted `CoinbaseOutputConstraints` (None until first decode on this session).
+type ConstraintsState = Arc<std::sync::Mutex<Option<CoinbaseConstraints>>>;
+
 fn template_id_for_cache(tmpl: &AzcoinTemplate) -> u64 {
     tmpl.height.max(1)
 }
@@ -143,6 +156,7 @@ async fn handle_connection(
     rpc: Arc<RpcClient>,
 ) -> Result<()> {
     let template_cache: TemplateIdCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let constraints_state: ConstraintsState = Arc::new(std::sync::Mutex::new(None));
 
     // ---- Noise NX handshake (responder side) --------------------------------
 
@@ -404,6 +418,7 @@ async fn handle_connection(
         peer,
         &mut template_rx,
         template_cache.clone(),
+        constraints_state.clone(),
     )
     .await
     {
@@ -425,6 +440,7 @@ async fn handle_connection(
                 rpc.clone(),
                 template_rx.clone(),
                 template_cache.clone(),
+                constraints_state.clone(),
             )
             .await
         }
@@ -457,6 +473,7 @@ async fn run_template_distribution_init(
     peer: SocketAddr,
     template_rx: &mut watch::Receiver<Option<AzcoinTemplate>>,
     template_cache: TemplateIdCache,
+    constraints_state: ConstraintsState,
 ) -> Result<()> {
     info!(
         peer = %peer,
@@ -516,7 +533,39 @@ async fn run_template_distribution_init(
         "Decoded CoinbaseOutputConstraints payload"
     );
 
+    let persisted = CoinbaseConstraints {
+        max_additional_size: constraints.coinbase_output_max_additional_size,
+        max_additional_sigops: constraints.coinbase_output_max_additional_sigops,
+    };
+    {
+        let mut guard = constraints_state.lock().expect("constraints state lock");
+        *guard = Some(persisted);
+    }
+    info!(
+        peer = %peer,
+        max_additional_size = persisted.max_additional_size,
+        max_additional_sigops = persisted.max_additional_sigops,
+        "Persisted CoinbaseOutputConstraints for this TP session"
+    );
+
     let tmpl = wait_for_template(template_rx).await?;
+
+    if let Err(reason) = validate_template_under_constraints(&tmpl, persisted) {
+        warn!(
+            peer = %peer,
+            height = tmpl.height,
+            template_id = tmpl.height.max(1),
+            size_limit = tmpl.size_limit,
+            sigop_limit = tmpl.sigop_limit,
+            tx_count = tmpl.transactions.len(),
+            max_additional_size = persisted.max_additional_size,
+            max_additional_sigops = persisted.max_additional_sigops,
+            reason = %reason,
+            "Initial template rejected by CoinbaseOutputConstraints: not sending NewTemplate/SetNewPrevHash; session kept alive"
+        );
+        return Ok(());
+    }
+
     send_template_pair(stream, transport_state, &tmpl, peer).await?;
     insert_template_id_cache(&template_cache, &tmpl);
 
@@ -566,6 +615,81 @@ fn encode_bip34_height_prefix(height: u64) -> Result<Vec<u8>> {
     );
     prefix.extend_from_slice(&encoded_height);
     Ok(prefix)
+}
+
+/// Conservative pre-send validation of `tmpl` against the per-session persisted
+/// `CoinbaseOutputConstraints`.
+///
+/// Reserves `max_additional_size` bytes and `max_additional_sigops` sigops for pool-added coinbase
+/// outputs, plus a maximally-sized (100-byte) coinbase script field, and compares a conservative
+/// serialized-size / sigops estimate against `template.size_limit` / `template.sigop_limit` (each
+/// check is skipped when the corresponding limit is `0`, i.e. unknown).
+fn validate_template_under_constraints(
+    tmpl: &AzcoinTemplate,
+    constraints: CoinbaseConstraints,
+) -> std::result::Result<(), String> {
+    let non_coinbase_bytes: u64 = tmpl
+        .transactions
+        .iter()
+        .map(|tx| (tx.data.trim().len() as u64) / 2)
+        .sum();
+
+    let fixed_outputs_bytes: u64 = match tmpl.default_witness_commitment.as_deref() {
+        Some(hex_str) => match hex::decode(hex_str.trim()) {
+            Ok(script) => {
+                let out = TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: ScriptBuf::from_bytes(script),
+                };
+                serialize(&out).len() as u64
+            }
+            Err(_) => 0,
+        },
+        None => 0,
+    };
+
+    // Conservative coinbase tx size, including a maximally-sized 100-byte coinbase script field
+    // and the reserved `max_additional_size` bytes for pool-added coinbase outputs.
+    let coinbase_size: u64 = 4      // version
+        + 1                         // input count varint (1 input)
+        + 36                        // prevout (32-byte txid + 4-byte vout)
+        + 1                         // script-length varint (<= 100 bytes fits in 1 byte)
+        + 100                       // reserved maximally-sized coinbase script field
+        + 4                         // input sequence
+        + 9                         // output count varint (conservative upper bound)
+        + fixed_outputs_bytes
+        + constraints.max_additional_size as u64
+        + 4;                        // locktime
+
+    // Conservative block size: header + tx count varint + coinbase + non-coinbase serialized bytes.
+    let block_size: u64 = 80 + 9 + coinbase_size + non_coinbase_bytes;
+
+    if tmpl.size_limit > 0 && block_size > tmpl.size_limit {
+        return Err(format!(
+            "estimated block size {} exceeds template.size_limit {} (coinbase_size={}, non_coinbase_bytes={}, fixed_outputs_bytes={}, max_additional_size={})",
+            block_size,
+            tmpl.size_limit,
+            coinbase_size,
+            non_coinbase_bytes,
+            fixed_outputs_bytes,
+            constraints.max_additional_size,
+        ));
+    }
+
+    let non_coinbase_sigops: u64 = tmpl.transactions.iter().map(|tx| tx.sigops).sum();
+    // TP-side fixed coinbase outputs are witness-commitment OP_RETURN-style (0 sigops) when present.
+    let total_sigops: u64 = non_coinbase_sigops + constraints.max_additional_sigops as u64;
+    if tmpl.sigop_limit > 0 && total_sigops > tmpl.sigop_limit {
+        return Err(format!(
+            "estimated sigops {} exceeds template.sigop_limit {} (non_coinbase_sigops={}, max_additional_sigops={})",
+            total_sigops,
+            tmpl.sigop_limit,
+            non_coinbase_sigops,
+            constraints.max_additional_sigops,
+        ));
+    }
+
+    Ok(())
 }
 
 /// Build and send `NewTemplate` then `SetNewPrevHash` for `tmpl` (ordering preserved).
@@ -1125,10 +1249,12 @@ async fn drain_encrypted_frames_with_live_updates(
     rpc: Arc<RpcClient>,
     template_rx: watch::Receiver<Option<AzcoinTemplate>>,
     template_cache: TemplateIdCache,
+    constraints_state: ConstraintsState,
 ) -> Result<()> {
     let mut read_transport_state = transport_state.clone();
     let peer_w = peer;
     let tc_writer = template_cache.clone();
+    let cs_writer = constraints_state.clone();
 
     tokio::spawn(async move {
         info!(
@@ -1197,6 +1323,36 @@ async fn drain_encrypted_frames_with_live_updates(
                         height = latest_payload.template.height,
                         "SV2 live writer: calling send_template_pair"
                     );
+                    let active_constraints = cs_writer
+                        .lock()
+                        .expect("constraints state lock")
+                        .unwrap_or_default();
+                    if let Err(reason) = validate_template_under_constraints(
+                        &latest_payload.template,
+                        active_constraints,
+                    ) {
+                        warn!(
+                            peer = %peer_w,
+                            height = latest_payload.template.height,
+                            template_id = latest_template_id,
+                            size_limit = latest_payload.template.size_limit,
+                            sigop_limit = latest_payload.template.sigop_limit,
+                            tx_count = latest_payload.template.transactions.len(),
+                            max_additional_size = active_constraints.max_additional_size,
+                            max_additional_sigops = active_constraints.max_additional_sigops,
+                            reason = %reason,
+                            "SV2 live writer: template rejected by CoinbaseOutputConstraints; skipping NewTemplate/SetNewPrevHash, session kept alive"
+                        );
+                        if exit_after_send {
+                            info!(
+                                peer = %peer_w,
+                                reason = "broadcast_closed",
+                                "SV2 live template writer task: recv loop exiting"
+                            );
+                            break;
+                        }
+                        continue;
+                    }
                     match send_template_pair(
                         &mut wh,
                         &mut write_transport_state,
@@ -1450,4 +1606,136 @@ fn decode_key(hex_str: &str, name: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|v: Vec<u8>| anyhow!("{name} must be 32 bytes (64 hex chars), got {}", v.len()))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests: CoinbaseOutputConstraints persistence + pre-send validation.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod constraints_tests {
+    use super::*;
+    use crate::template::{AzcoinTemplate, TemplateTx};
+
+    /// Build a minimal [`AzcoinTemplate`] with a single non-coinbase transaction whose raw hex
+    /// `data` is `non_coinbase_tx_bytes` bytes long (2 hex chars per byte).
+    fn make_template(
+        size_limit: u64,
+        sigop_limit: u64,
+        non_coinbase_tx_bytes: u64,
+        non_coinbase_sigops: u64,
+    ) -> AzcoinTemplate {
+        let transactions = if non_coinbase_tx_bytes > 0 {
+            let data = "aa".repeat(non_coinbase_tx_bytes as usize);
+            vec![TemplateTx {
+                txid: "deadbeef".into(),
+                fee: 0,
+                weight: 0,
+                sigops: non_coinbase_sigops,
+                data,
+            }]
+        } else {
+            Vec::new()
+        };
+        AzcoinTemplate {
+            height: 201,
+            version: 536870912,
+            previous_block_hash: "00".repeat(32),
+            bits: "207fffff".into(),
+            target: "00".repeat(32),
+            curtime: 0,
+            mintime: 0,
+            coinbase_value: 5_000_000_000,
+            size_limit,
+            weight_limit: 0,
+            sigop_limit,
+            default_witness_commitment: None,
+            transactions,
+        }
+    }
+
+    #[test]
+    fn persisted_constraints_overwrite_previous_constraints() {
+        let state: ConstraintsState = Arc::new(std::sync::Mutex::new(None));
+        {
+            let mut g = state.lock().unwrap();
+            *g = Some(CoinbaseConstraints {
+                max_additional_size: 100,
+                max_additional_sigops: 5,
+            });
+        }
+        {
+            let mut g = state.lock().unwrap();
+            *g = Some(CoinbaseConstraints {
+                max_additional_size: 2_000,
+                max_additional_sigops: 77,
+            });
+        }
+        let got = state.lock().unwrap().expect("constraints must be persisted");
+        assert_eq!(got.max_additional_size, 2_000);
+        assert_eq!(got.max_additional_sigops, 77);
+    }
+
+    #[test]
+    fn validation_passes_with_sufficient_headroom() {
+        let tmpl = make_template(1_000_000, 10_000, 200, 10);
+        let c = CoinbaseConstraints {
+            max_additional_size: 1_000,
+            max_additional_sigops: 100,
+        };
+        validate_template_under_constraints(&tmpl, c)
+            .expect("should pass with generous size and sigop headroom");
+    }
+
+    #[test]
+    fn validation_fails_when_additional_size_headroom_insufficient() {
+        // Tight size budget; blow it out via max_additional_size.
+        let tmpl = make_template(500, 10_000, 100, 0);
+        let c = CoinbaseConstraints {
+            max_additional_size: 10_000,
+            max_additional_sigops: 0,
+        };
+        let err = validate_template_under_constraints(&tmpl, c)
+            .expect_err("should fail when additional-size headroom is insufficient");
+        assert!(
+            err.contains("template.size_limit"),
+            "error should cite size_limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validation_fails_when_additional_sigops_headroom_insufficient() {
+        let tmpl = make_template(1_000_000, 100, 100, 50);
+        let c = CoinbaseConstraints {
+            max_additional_size: 0,
+            max_additional_sigops: 1_000,
+        };
+        let err = validate_template_under_constraints(&tmpl, c)
+            .expect_err("should fail when additional-sigops headroom is insufficient");
+        assert!(
+            err.contains("template.sigop_limit"),
+            "error should cite sigop_limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validation_default_constraints_no_constraint_path_still_valid() {
+        // Mimics the "no constraints received yet" / default path: zero reservation.
+        let tmpl = make_template(4_000_000, 80_000, 2_000, 50);
+        let c = CoinbaseConstraints::default();
+        validate_template_under_constraints(&tmpl, c)
+            .expect("default/no-constraint path must pass under realistic limits");
+    }
+
+    #[test]
+    fn validation_skips_limits_when_template_limits_are_zero() {
+        // size_limit == 0 and sigop_limit == 0 must skip both checks.
+        let tmpl = make_template(0, 0, 100, 10);
+        let c = CoinbaseConstraints {
+            max_additional_size: u32::MAX,
+            max_additional_sigops: u16::MAX,
+        };
+        validate_template_under_constraints(&tmpl, c)
+            .expect("zero template limits must skip validation");
+    }
 }
