@@ -1006,14 +1006,6 @@ fn block_bytes_from_submit_solution(
     coinbase_raw: &[u8],
     tmpl: &AzcoinTemplate,
 ) -> Result<Vec<u8>> {
-    let snapshot_tid = tmpl.height.max(1);
-    if sol_template_id != snapshot_tid {
-        anyhow::bail!(
-            "SubmitSolution.template_id {} does not match resolved snapshot template_id {}",
-            sol_template_id,
-            snapshot_tid
-        );
-    }
     let coinbase: Transaction =
         deserialize(coinbase_raw).context("deserialize SubmitSolution.coinbase_tx")?;
     info!(
