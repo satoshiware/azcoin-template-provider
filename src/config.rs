@@ -37,12 +37,12 @@ pub struct Config {
     /// e.g. `"0.0.0.0:8442"`.
     #[serde(default = "default_tp_listen_address")]
     pub tp_listen_address: String,
-    /// Noise authority public key (hex-encoded).  Will be used for SV2
-    /// Noise handshake authentication in a future phase.
+    /// Noise authority public key as lowercase/uppercase hex for the raw 32-byte
+    /// secp256k1 x-only public key used by the SV2 Noise responder.
     #[serde(default)]
     pub authority_public_key: String,
-    /// Noise authority secret key (hex-encoded).  Will be used for SV2
-    /// Noise handshake authentication in a future phase.
+    /// Noise authority secret key as hex for the raw 32-byte secp256k1 secret key
+    /// matching `authority_public_key`.
     #[serde(default)]
     #[allow(dead_code)]
     pub authority_secret_key: String,
@@ -70,10 +70,7 @@ impl Config {
             "poll_interval_ms must be >= 100 (got {})",
             self.poll_interval_ms
         );
-        anyhow::ensure!(
-            !self.network.is_empty(),
-            "network must not be empty"
-        );
+        anyhow::ensure!(!self.network.is_empty(), "network must not be empty");
         Ok(())
     }
 }

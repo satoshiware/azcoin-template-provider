@@ -1,5 +1,8 @@
 //! Block template types and change-detection logic.
 //!
+//! `default_witness_commitment` (when present) flows into SV2 `NewTemplate` placeholder outputs in
+//! [`crate::tp_server`] (**0.2.0-r1**).
+//!
 //! This module defines two layers of types:
 //!
 //! 1. **`Rpc*` structs** — raw JSON-RPC response shapes that mirror exactly
@@ -132,10 +135,17 @@ pub struct RpcBlockHeader {
 // Normalized internal representation — decoupled from the wire format.
 // ---------------------------------------------------------------------------
 
-/// Latest template snapshot for live SV2 pushes (built from polled [`AzcoinTemplate`]).
+/// Provider-side snapshot of a polled template with the exact SV2 `template_id` assigned to it.
+#[derive(Clone, Debug)]
+pub struct TemplateSnapshot {
+    pub template_id: u64,
+    pub template: AzcoinTemplate,
+}
+
+/// Latest template snapshot for live SV2 pushes (built from polled [`TemplateSnapshot`]).
 #[derive(Clone, Debug)]
 pub struct TemplateUpdatePayload {
-    pub template: AzcoinTemplate,
+    pub snapshot: TemplateSnapshot,
 }
 
 /// Fingerprint for deduplicating SV2 template pushes across polls.
@@ -249,7 +259,11 @@ impl AzcoinTemplate {
             ));
         }
 
-        let prev_txids: Vec<&str> = previous.transactions.iter().map(|t| t.txid.as_str()).collect();
+        let prev_txids: Vec<&str> = previous
+            .transactions
+            .iter()
+            .map(|t| t.txid.as_str())
+            .collect();
         let curr_txids: Vec<&str> = self.transactions.iter().map(|t| t.txid.as_str()).collect();
 
         if prev_txids != curr_txids || self.coinbase_value != previous.coinbase_value {
@@ -419,7 +433,10 @@ mod tests {
         assert_eq!(tpl.height, 100);
         assert!(tpl.rules.is_empty());
         assert!(tpl.default_witness_commitment.is_none());
-        assert_eq!(tpl.weightlimit, 0, "missing weightlimit should default to 0");
+        assert_eq!(
+            tpl.weightlimit, 0,
+            "missing weightlimit should default to 0"
+        );
         assert_eq!(tpl.sigoplimit, 0);
         assert_eq!(tpl.sizelimit, 0);
     }
@@ -478,11 +495,24 @@ mod tests {
 
     #[test]
     fn detect_new_block() {
-        let prev = make_template(200, "aaaa0000bbbb1111cccc2222dddd3333eeee4444ffff5555aaaa0000bbbb1111", 5_000_000_000, &["tx1"]);
-        let curr = make_template(201, "bbbb1111cccc2222dddd3333eeee4444ffff5555aaaa0000bbbb1111cccc2222", 5_000_000_000, &["tx1"]);
+        let prev = make_template(
+            200,
+            "aaaa0000bbbb1111cccc2222dddd3333eeee4444ffff5555aaaa0000bbbb1111",
+            5_000_000_000,
+            &["tx1"],
+        );
+        let curr = make_template(
+            201,
+            "bbbb1111cccc2222dddd3333eeee4444ffff5555aaaa0000bbbb1111cccc2222",
+            5_000_000_000,
+            &["tx1"],
+        );
 
         let msg = curr.describe_change(&prev).expect("should detect change");
-        assert!(msg.contains("new block"), "expected 'new block', got: {msg}");
+        assert!(
+            msg.contains("new block"),
+            "expected 'new block', got: {msg}"
+        );
         assert!(msg.contains("200"), "should mention old height");
         assert!(msg.contains("201"), "should mention new height");
     }
@@ -494,8 +524,14 @@ mod tests {
         let curr = make_template(200, hash, 5_000_020_000, &["tx1", "tx2"]);
 
         let msg = curr.describe_change(&prev).expect("should detect change");
-        assert!(msg.contains("template updated"), "expected 'template updated', got: {msg}");
-        assert!(msg.contains("txs 1 -> 2"), "should show tx count change, got: {msg}");
+        assert!(
+            msg.contains("template updated"),
+            "expected 'template updated', got: {msg}"
+        );
+        assert!(
+            msg.contains("txs 1 -> 2"),
+            "should show tx count change, got: {msg}"
+        );
     }
 
     #[test]

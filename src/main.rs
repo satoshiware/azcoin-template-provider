@@ -12,18 +12,19 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
 
+/// Capacity for `tokio::sync::broadcast` used to push live template updates to SV2 sessions.
+/// Larger depth reduces `RecvError::Lagged` / drops when many templates arrive in a burst (0.2.0-r1).
 const TEMPLATE_BROADCAST_BUFFER_DEPTH: usize = 512;
 
 #[derive(Parser)]
 #[command(name = "azcoin-template-provider")]
-#[command(version, about = "RPC adapter for azcoind block templates")]
+#[command(
+    version,
+    about = "AZCOIN SV2 Template Provider — GBT polling, live templates, SubmitSolution → submitblock"
+)]
 struct Cli {
     /// Path to TOML configuration file.
-    #[arg(
-        short,
-        long,
-        default_value = "config/azcoin-template-provider.toml"
-    )]
+    #[arg(short, long, default_value = "config/azcoin-template-provider.toml")]
     config: PathBuf,
 }
 
@@ -60,10 +61,9 @@ async fn main() -> Result<()> {
     health::check_rpc_connectivity(client.as_ref(), &cfg).await?;
 
     let (template_tx, template_rx) = tokio::sync::watch::channel(None);
-    let (template_push_tx, _) =
-        tokio::sync::broadcast::channel::<crate::template::TemplateUpdatePayload>(
-            TEMPLATE_BROADCAST_BUFFER_DEPTH,
-        );
+    let (template_push_tx, _) = tokio::sync::broadcast::channel::<
+        crate::template::TemplateUpdatePayload,
+    >(TEMPLATE_BROADCAST_BUFFER_DEPTH);
     info!(
         template_broadcast_buffer_depth = TEMPLATE_BROADCAST_BUFFER_DEPTH,
         "Template broadcast buffer configured"

@@ -8,6 +8,8 @@
 #      config/azcoin-template-provider.toml
 #
 # The service reads this file at startup (override with --config <path>).
+#
+# See README.md for the 0.2.0-r1 operational baseline (SV2 live templates + SubmitSolution).
 
 # ----------------------------------------------------------------------------
 # RPC connection
@@ -72,7 +74,11 @@ tp_listen_address = "0.0.0.0:8442"
 #
 # The responder uses this keypair to sign the handshake certificate that
 # proves its identity to the connecting pool.  The pool must be configured
-# with the matching authority_public_key.
+# with the matching authority_public_key pasted into:
+#   [template_provider_type.Sv2Tp]
+#   public_key = "<authority_public_key>"
+#
+# The pool expects the raw 32-byte secp256k1 x-only public key encoded as hex.
 #
 # !! FOR TESTING / DEVELOPMENT ONLY !!
 # The keys below are the well-known secp256k1 generator-point keypair

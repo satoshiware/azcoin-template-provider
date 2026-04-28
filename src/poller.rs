@@ -5,8 +5,12 @@
 //! previous template.  Changes are logged at `INFO`; identical templates are
 //! logged at `DEBUG`.
 //!
-//! Each new template is also published through a [`tokio::sync::watch`]
-//! channel so the TP server can read the latest template at any time.
+//! Each new template is published through a [`tokio::sync::watch`] channel so
+//! [`crate::tp_server`] always has the latest snapshot. **On meaningful change**
+//! (see [`AzcoinTemplate::describe_change()`][crate::template::AzcoinTemplate::describe_change]),
+//! the same template is also sent on a [`tokio::sync::broadcast`] channel so
+//! connected SV2 sessions can roll forward with `NewTemplate` + `SetNewPrevHash`
+//! (release **`0.2.0-r1`** behavior).
 //!
 //! The loop is resilient — a single failed RPC call logs an error and retries
 //! on the next tick without crashing the service.
@@ -19,7 +23,9 @@ use tokio::time;
 use tracing::{debug, error, info};
 
 use crate::rpc::RpcClient;
-use crate::template::{template_push_fingerprint, AzcoinTemplate, TemplateUpdatePayload};
+use crate::template::{
+    template_push_fingerprint, AzcoinTemplate, TemplateSnapshot, TemplateUpdatePayload,
+};
 
 /// Run the polling loop until the process is terminated.
 ///
@@ -28,13 +34,14 @@ use crate::template::{template_push_fingerprint, AzcoinTemplate, TemplateUpdateP
 pub async fn run(
     client: &RpcClient,
     poll_interval_ms: u64,
-    template_tx: watch::Sender<Option<AzcoinTemplate>>,
+    template_tx: watch::Sender<Option<TemplateSnapshot>>,
     template_push_tx: broadcast::Sender<TemplateUpdatePayload>,
 ) -> Result<()> {
     let interval = Duration::from_millis(poll_interval_ms);
     let mut ticker = time::interval(interval);
-    let mut previous: Option<AzcoinTemplate> = None;
+    let mut previous: Option<TemplateSnapshot> = None;
     let mut last_push_fp: Option<u64> = None;
+    let mut next_template_id: u64 = 1;
     let mut poll_count: u64 = 0;
 
     info!(interval_ms = poll_interval_ms, "Starting template poller");
@@ -53,7 +60,7 @@ pub async fn run(
 
         let template = AzcoinTemplate::from_rpc(&rpc_template);
 
-        match &previous {
+        match previous.as_ref().map(|p| &p.template) {
             None => {
                 info!(
                     poll         = poll_count,
@@ -79,24 +86,37 @@ pub async fn run(
                     );
                 }
                 None => {
-                    debug!(poll = poll_count, height = template.height, "Template unchanged");
+                    debug!(
+                        poll = poll_count,
+                        height = template.height,
+                        "Template unchanged"
+                    );
                 }
             },
         }
 
         let fp = template_push_fingerprint(&template);
         let fp_changed = last_push_fp != Some(fp);
-        if fp_changed {
+        let snapshot = if fp_changed {
+            let template_id = next_template_id;
+            next_template_id = next_template_id
+                .checked_add(1)
+                .expect("template_id allocator exhausted u64 space");
+            let snapshot = TemplateSnapshot {
+                template_id,
+                template: template.clone(),
+            };
             if last_push_fp.is_some() {
                 info!(
                     poll = poll_count,
                     height = template.height,
                     prev_hash = %template.previous_block_hash,
                     fingerprint = fp,
+                    template_id = snapshot.template_id,
                     "Template change detected (SV2 push fingerprint)"
                 );
             }
-            let old_height = previous.as_ref().map(|p| p.height);
+            let old_height = previous.as_ref().map(|p| p.template.height);
             let receiver_count = template_push_tx.receiver_count();
             info!(
                 poll = poll_count,
@@ -104,21 +124,24 @@ pub async fn run(
                 new_height = template.height,
                 old_fingerprint = ?last_push_fp,
                 new_fingerprint = fp,
+                template_id = snapshot.template_id,
                 receiver_count = receiver_count,
                 "SV2 live broadcast: about to send (pre-send instrumentation)"
             );
             let send_result = template_push_tx.send(TemplateUpdatePayload {
-                template: template.clone(),
+                snapshot: snapshot.clone(),
             });
             match &send_result {
                 Ok(n_receivers) => info!(
                     poll = poll_count,
+                    template_id = snapshot.template_id,
                     receivers_notified = *n_receivers,
                     result = "Ok",
                     "SV2 live broadcast: send result"
                 ),
                 Err(e) => info!(
                     poll = poll_count,
+                    template_id = snapshot.template_id,
                     result = "Err",
                     error = ?e,
                     "SV2 live broadcast: send result"
@@ -128,15 +151,29 @@ pub async fn run(
                 Ok(n) => info!(
                     poll = poll_count,
                     receivers = n,
+                    template_id = snapshot.template_id,
                     height = template.height,
                     "Template update queued for SV2 pool sessions"
                 ),
-                Err(_) => debug!(poll = poll_count, "template push channel closed; skip SV2 queue"),
+                Err(_) => debug!(
+                    poll = poll_count,
+                    "template push channel closed; skip SV2 queue"
+                ),
             }
             last_push_fp = Some(fp);
-        }
+            snapshot
+        } else {
+            let template_id = previous
+                .as_ref()
+                .map(|p| p.template_id)
+                .expect("initial template must allocate a template_id");
+            TemplateSnapshot {
+                template_id,
+                template: template.clone(),
+            }
+        };
 
-        let _ = template_tx.send(Some(template.clone()));
-        previous = Some(template);
+        let _ = template_tx.send(Some(snapshot.clone()));
+        previous = Some(snapshot);
     }
 }
