@@ -13,7 +13,7 @@ use clap::Parser;
 use tracing::{info, warn};
 
 /// Capacity for `tokio::sync::broadcast` used to push live template updates to SV2 sessions.
-/// Larger depth reduces `RecvError::Lagged` / drops when many templates arrive in a burst (0.2.0-r1).
+/// Larger depth reduces `RecvError::Lagged` / drops when many templates arrive in a burst (0.2.0).
 const TEMPLATE_BROADCAST_BUFFER_DEPTH: usize = 512;
 
 #[derive(Parser)]

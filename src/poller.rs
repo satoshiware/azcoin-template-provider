@@ -10,7 +10,7 @@
 //! (see [`AzcoinTemplate::describe_change()`][crate::template::AzcoinTemplate::describe_change]),
 //! the same template is also sent on a [`tokio::sync::broadcast`] channel so
 //! connected SV2 sessions can roll forward with `NewTemplate` + `SetNewPrevHash`
-//! (release **`0.2.0-r1`** behavior).
+//! (release **`0.2.0`** stable behavior).
 //!
 //! The loop is resilient — a single failed RPC call logs an error and retries
 //! on the next tick without crashing the service.

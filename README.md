@@ -1,8 +1,8 @@
-# azcoin-template-provider **0.2.0-r1**
+# azcoin-template-provider **0.2.0**
 
-Stable baseline for the AZCOIN Stratum V2 mining path. This service sits between `azcoind` and `pool_sv2`: it polls the node for block templates, converts them into SV2 Template Distribution messages, pushes fresh work to the pool, accepts `SubmitSolution` when a block is found, assembles the full block, and submits it via `submitblock`.
+**Stable, released.** This is the production baseline for the AZCOIN Stratum V2 mining path. The service sits between `azcoind` and `pool_sv2`: it polls the node for block templates, converts them into SV2 Template Distribution messages, pushes fresh work to the pool, accepts `SubmitSolution` when a block is found, assembles the full block, and submits it via `submitblock`.
 
-**Release 0.2.0-r1** keeps the proven 0.2.0 design and closes the remaining `pool_sv2` compatibility gaps around template identity, `CoinbaseOutputConstraints`, and `RequestTransactionData`. This document matches crate version **0.2.0-r1** (`Cargo.toml`).
+**Release 0.2.0** is done: `pool_sv2` compatibility for template identity, `CoinbaseOutputConstraints`, and `RequestTransactionData`, plus split read/write codec, live roll-forward, and block submission. This document matches crate version **0.2.0** (`Cargo.toml`).
 
 ---
 
@@ -16,7 +16,7 @@ Stable baseline for the AZCOIN Stratum V2 mining path. This service sits between
 
 ---
 
-## Scope of 0.2.0-r1
+## Scope of 0.2.0
 
 ### Included
 
@@ -96,7 +96,7 @@ Typical deployment paths (adjust for your host):
 
 ---
 
-## Proven runtime behavior (0.2.0-r1)
+## Proven runtime behavior (0.2.0)
 
 - Pool receives live `NewTemplate` and `SetNewPrevHash`.
 - Pool sends `SubmitSolution` on found block.
@@ -104,7 +104,7 @@ Typical deployment paths (adjust for your host):
 - `azcoind` accepts the block via `submitblock` (null result).
 - Accepted blocks land on-chain; rewards credit to the payout path configured in pool/node policy (immature coinbase outputs in the operator wallet is the common deployment pattern).
 
-**What 0.2.0-r1 does not prove:** per-miner accounting, authoritative worker ledgers, or a payout engine — build those as separate services.
+**What 0.2.0 does not prove:** per-miner accounting, authoritative worker ledgers, or a payout engine — build those as separate services.
 
 ---
 
@@ -224,7 +224,7 @@ sudo journalctl -u pool-sv2.service --since '30 minutes ago' --no-pager | \
 
 ## Reward routing (operational truth)
 
-Coinbase pays the addresses encoded by pool/template rules in your deployment. **Template Provider 0.2.0-r1 does not implement per-miner payout splits** — the operator or pool layer must add share accounting, balances, and payout policy separately.
+Coinbase pays the addresses encoded by pool/template rules in your deployment. **Template Provider 0.2.0 does not implement per-miner payout splits** — the operator or pool layer must add share accounting, balances, and payout policy separately.
 
 ---
 
@@ -277,11 +277,11 @@ If `azcoind` adds fields, extend `Rpc*` types in `src/template.rs` and extend fi
 
 ---
 
-## Release statement (0.2.0-r1)
+## Release statement (0.2.0)
 
-Template Provider **0.2.0-r1** keeps the stable 0.2.0 baseline and adds the missing `pool_sv2` correctness pieces: monotonic template identity, transaction-data responses, coinbase-output-constraint enforcement, and explicit authority public-key guidance — **not** a complete payout product.
+Template Provider **0.2.0** is the **stable, released** line for AZCOIN: monotonic template identity, transaction-data responses, coinbase-output-constraint enforcement, explicit authority public-key guidance, split read/write codec, and `SubmitSolution` → `submitblock` — **not** a complete payout product.
 
-**Short version:** it sends the right work, receives solved blocks, gets them accepted, and produces real on-chain rewards. Per-miner payout systems are out of scope for this crate.
+**Short version:** it sends the right work, receives solved blocks, gets them accepted, and produces real on-chain rewards. Per-miner payout systems are out of scope for this crate. The core Template Provider surface is complete for 0.2.x unless you introduce new protocol or deployment requirements.
 
 ---
 

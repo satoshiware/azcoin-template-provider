@@ -1,4 +1,4 @@
-//! SV2 Template Provider (**0.2.0-r1** baseline): Noise, `SetupConnection`, Template Distribution, live
+//! SV2 Template Provider (**0.2.0** stable): Noise, `SetupConnection`, Template Distribution, live
 //! roll-forward, and `SubmitSolution` → full block → [`crate::rpc::RpcClient::submit_block`].
 //!
 //! # Role in the mining path

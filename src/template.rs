@@ -1,7 +1,7 @@
 //! Block template types and change-detection logic.
 //!
 //! `default_witness_commitment` (when present) flows into SV2 `NewTemplate` placeholder outputs in
-//! [`crate::tp_server`] (**0.2.0-r1**).
+//! [`crate::tp_server`] (**0.2.0** stable).
 //!
 //! This module defines two layers of types:
 //!

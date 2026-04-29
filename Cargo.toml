@@ -1,6 +1,6 @@
 [package]
 name = "azcoin-template-provider"
-version = "0.2.0-r1"
+version = "0.2.0"
 edition = "2021"
 description = "AZCOIN SV2 Template Provider — getblocktemplate polling, live SV2 template distribution, SubmitSolution → submitblock"
 
