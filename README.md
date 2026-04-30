@@ -133,7 +133,19 @@ There is **no HTTP health server** by design.
 
 ### Structured log events
 
-Logs use `tracing` with the default human-readable formatter and wall-clock **timestamps on each line** (`tracing_subscriber::fmt::time::SystemTime`). Filter or ship logs by the stable **`event`** field where present:
+**Operational defaults:** At **`RUST_LOG=info`** (the default subscriber filter unless you export `RUST_LOG`), **`journalctl`/`stdout` favors stable audit lines.** Grep **`event=`** for lifecycle and submission summaries: `grep event=` or `journalctl … | grep 'event='`. Low-level internals (Noise steps, SV2 framing, broadcast queue bookkeeping, `write_td_frame`) are **`debug`** or **`trace`** so they do not overwhelm operators at default verbosity.
+
+Raise verbosity when diagnosing protocol issues:
+
+```bash
+RUST_LOG=azcoin_template_provider=debug,info ./target/release/azcoin-template-provider
+# Finer protocol stepping (Noise bytes, TD frame internals):
+RUST_LOG=azcoin_template_provider=trace,info ./target/release/azcoin-template-provider
+```
+
+`warn!` / `error!` calls are unchanged and stay visible under the default filter.
+
+Logs use `tracing` with wall-clock **timestamps on each line** (`tracing_subscriber::fmt::time::SystemTime`). Filter or ship logs by the stable **`event`** field where present:
 
 | `event` | Meaning |
 |---------|---------|

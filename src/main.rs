@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Capacity for `tokio::sync::broadcast` used to push live template updates to SV2 sessions.
 /// Larger depth reduces `RecvError::Lagged` / drops when many templates arrive in a burst (0.2.0).
@@ -43,14 +43,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    info!(path = %cli.config.display(), "Loading configuration");
+    debug!(path = %cli.config.display(), "Loading configuration");
     let cfg = config::Config::load(&cli.config)?;
-    info!(
+    debug!(
         rpc_url  = %cfg.rpc_url,
         network  = %cfg.network,
         poll_ms  = cfg.poll_interval_ms,
         tp_addr  = %cfg.tp_listen_address,
-        "Configuration loaded"
+        "Configuration deserialized and validated"
     );
 
     let client = Arc::new(
@@ -76,9 +76,9 @@ async fn main() -> Result<()> {
     let (template_push_tx, _) = tokio::sync::broadcast::channel::<
         crate::template::TemplateUpdatePayload,
     >(TEMPLATE_BROADCAST_BUFFER_DEPTH);
-    info!(
+    debug!(
         template_broadcast_buffer_depth = TEMPLATE_BROADCAST_BUFFER_DEPTH,
-        "Template broadcast buffer configured"
+        "Template broadcast channel initialized"
     );
 
     let keys_configured =
@@ -97,9 +97,9 @@ async fn main() -> Result<()> {
     );
 
     if keys_configured {
-        info!(
+        debug!(
             tp_address = %cfg.tp_listen_address,
-            "Starting SV2 Template Provider (Noise-authenticated)"
+            "Starting SV2 listener + poller (Noise-authenticated Template Distribution)"
         );
         let push = template_push_tx.clone();
         let rpc_tp = client.clone();

@@ -10,25 +10,25 @@
 //! rather than silently polling a misconfigured node.
 
 use anyhow::{bail, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::rpc::RpcClient;
 
 /// Verify RPC connectivity and validate chain/network agreement.
 pub async fn check_rpc_connectivity(client: &RpcClient, config: &Config) -> Result<()> {
-    info!(url = %config.rpc_url, "Connecting to azcoind");
+    debug!(url = %config.rpc_url, "Calling getblockchaininfo for startup check");
 
     let info = client.get_blockchain_info().await?;
 
-    info!(
+    debug!(
         chain       = %info.chain,
         blocks      = info.blocks,
         headers     = info.headers,
         best_hash   = %info.bestblockhash,
         ibd         = info.initialblockdownload,
         sync        = format_args!("{:.4}%", info.verificationprogress * 100.0),
-        "RPC connection established"
+        "getblockchaininfo response"
     );
 
     if info.chain != config.network {

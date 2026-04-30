@@ -2,8 +2,8 @@
 //!
 //! Calls `getblocktemplate` every `poll_interval_ms` milliseconds, converts
 //! the raw RPC response into an [`AzcoinTemplate`], and compares it to the
-//! previous template.  Changes are logged at `INFO`; identical templates are
-//! logged at `DEBUG`.
+//! previous template.  Stable `event=` fields are emitted at **`INFO`**; redundant
+//! broadcaster bookkeeping logs are **`DEBUG`**. Identical consecutive templates stay **`DEBUG`**.
 //!
 //! Each new template is published through a [`tokio::sync::watch`] channel so
 //! [`crate::tp_server`] always has the latest snapshot. **On meaningful change**
@@ -44,7 +44,10 @@ pub async fn run(
     let mut next_template_id: u64 = 1;
     let mut poll_count: u64 = 0;
 
-    info!(interval_ms = poll_interval_ms, "Starting template poller");
+    debug!(
+        interval_ms = poll_interval_ms,
+        "Starting template poller loop"
+    );
 
     loop {
         ticker.tick().await;
@@ -149,7 +152,7 @@ pub async fn run(
             }
             let old_height = previous.as_ref().map(|p| p.template.height);
             let receiver_count = template_push_tx.receiver_count();
-            info!(
+            debug!(
                 poll = poll_count,
                 old_height = ?old_height,
                 new_height = template.height,
@@ -157,34 +160,34 @@ pub async fn run(
                 new_fingerprint = fp,
                 template_id = snapshot.template_id,
                 receiver_count = receiver_count,
-                "SV2 live broadcast: about to send (pre-send instrumentation)"
+                "SV2 broadcast queue: enqueue template update"
             );
             let send_result = template_push_tx.send(TemplateUpdatePayload {
                 snapshot: snapshot.clone(),
             });
             match &send_result {
-                Ok(n_receivers) => info!(
+                Ok(n_receivers) => debug!(
                     poll = poll_count,
                     template_id = snapshot.template_id,
                     receivers_notified = *n_receivers,
                     result = "Ok",
-                    "SV2 live broadcast: send result"
+                    "SV2 broadcast: send_complete"
                 ),
-                Err(e) => info!(
+                Err(e) => debug!(
                     poll = poll_count,
                     template_id = snapshot.template_id,
                     result = "Err",
                     error = ?e,
-                    "SV2 live broadcast: send result"
+                    "SV2 broadcast: send_complete"
                 ),
             }
             match send_result {
-                Ok(n) => info!(
+                Ok(n) => debug!(
                     poll = poll_count,
                     receivers = n,
                     template_id = snapshot.template_id,
                     height = template.height,
-                    "Template update queued for SV2 pool sessions"
+                    "SV2 broadcast: template update dispatched to subscribed sessions"
                 ),
                 Err(_) => debug!(
                     poll = poll_count,

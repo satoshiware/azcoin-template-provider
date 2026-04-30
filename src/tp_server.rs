@@ -62,7 +62,7 @@ use template_distribution_sv2::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::rpc::RpcClient;
 use crate::template::{AzcoinTemplate, TemplateSnapshot, TemplateUpdatePayload};
@@ -245,7 +245,7 @@ fn insert_template_id_cache(cache: &TemplateIdCache, snapshot: &TemplateSnapshot
     }
     let len = m.len();
     drop(m);
-    info!(
+    debug!(
         template_id = tid,
         cache_len = len,
         height = snapshot.template.height,
@@ -285,7 +285,7 @@ pub async fn run(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                info!(peer = %peer, "Incoming TCP connection");
+                debug!(peer = %peer, "Incoming TCP connection");
                 let pk = pub_key;
                 let sk = sec_key;
                 let rx = template_rx.clone();
@@ -326,19 +326,19 @@ async fn handle_connection(
 
     // ---- Noise NX handshake (responder side) --------------------------------
 
-    info!(peer = %peer, "Noise handshake: creating responder");
+    trace!(peer = %peer, "Noise handshake: creating responder");
 
     let mut responder = Responder::from_authority_kp(authority_pub, authority_sec, CERT_VALIDITY)
         .map_err(|e| anyhow!("failed to create Noise responder: {:?}", e))?;
 
-    info!(peer = %peer, "Noise handshake: waiting for initiator ephemeral key");
+    trace!(peer = %peer, "Noise handshake: waiting for initiator ephemeral key");
     let mut initiator_ephemeral = [0u8; noise_sv2::ELLSWIFT_ENCODING_SIZE];
     stream
         .read_exact(&mut initiator_ephemeral)
         .await
         .context("failed to read initiator ephemeral key")?;
 
-    info!(peer = %peer, "Noise handshake: computing response");
+    trace!(peer = %peer, "Noise handshake: computing response");
     let (response, noise_codec) = responder
         .step_1(initiator_ephemeral)
         .map_err(|e| anyhow!("Noise handshake step_1 failed: {:?}", e))?;
@@ -349,7 +349,7 @@ async fn handle_connection(
         .context("failed to send Noise response")?;
     stream.flush().await?;
 
-    info!(peer = %peer, "Noise handshake completed — encrypted transport established");
+    trace!(peer = %peer, "Noise handshake completed — encrypted transport established");
 
     let mut transport_state = codec_sv2::State::with_transport_mode(noise_codec);
 
@@ -357,11 +357,11 @@ async fn handle_connection(
 
     let mut decoder = StandardNoiseDecoder::<SetupConnection>::new();
 
-    info!(peer = %peer, "SV2 application: waiting for first encrypted frame");
+    trace!(peer = %peer, "SV2 application: waiting for first encrypted frame");
     let (header, mut payload_bytes, cipher_len) =
         read_encrypted_sv2_frame(&mut stream, &mut decoder, &mut transport_state, peer).await?;
 
-    info!(
+    trace!(
         peer = %peer,
         cipher_bytes = cipher_len,
         msg_type = header.msg_type(),
@@ -449,7 +449,7 @@ async fn handle_connection(
         .await;
     }
 
-    info!(
+    debug!(
         peer = %peer,
         "Frame-level validation passed (SetupConnection, extension_type=0, channel_msg=false)"
     );
@@ -479,7 +479,7 @@ async fn handle_connection(
         }
     };
 
-    info!(peer = %peer, setup = %setup, "Decoded SetupConnection body");
+    debug!(peer = %peer, setup = %setup, "Decoded SetupConnection body");
 
     if setup.protocol != Protocol::TemplateDistributionProtocol {
         warn!(
@@ -507,7 +507,7 @@ async fn handle_connection(
         .await;
     }
 
-    info!(
+    debug!(
         peer = %peer,
         "Payload-level validation passed (SetupConnection.protocol = Template Distribution)"
     );
@@ -587,7 +587,7 @@ async fn handle_connection(
     {
         Ok(()) => {
             let upd_rx = template_push_tx.subscribe();
-            info!(
+            debug!(
                 peer = %peer,
                 receiver_count = template_push_tx.receiver_count(),
                 "SV2 live template push: subscribed Receiver for this session"
@@ -638,7 +638,7 @@ async fn run_template_distribution_init(
     template_cache: TemplateIdCache,
     session_constraints: SessionConstraintsState,
 ) -> Result<()> {
-    info!(
+    debug!(
         peer = %peer,
         "Waiting for first Template Distribution message after SetupConnectionSuccess"
     );
@@ -647,7 +647,7 @@ async fn run_template_distribution_init(
         read_encrypted_sv2_frame(stream, decoder, transport_state, peer).await?;
 
     let mt = header.msg_type();
-    info!(
+    trace!(
         peer = %peer,
         cipher_bytes = cipher_len,
         msg_type = mt,
@@ -664,7 +664,7 @@ async fn run_template_distribution_init(
         header.channel_msg()
     );
 
-    info!(
+    trace!(
         peer = %peer,
         extension_type = COMMON_MSG_EXTENSION_TYPE,
         channel_msg = false,
@@ -677,7 +677,7 @@ async fn run_template_distribution_init(
         mt
     );
 
-    info!(
+    trace!(
         peer = %peer,
         msg_type = mt,
         "TD dispatch by msg_type: CoinbaseOutputConstraints"
@@ -686,7 +686,7 @@ async fn run_template_distribution_init(
     let constraints: CoinbaseOutputConstraints = from_bytes(&mut payload)
         .map_err(|e| anyhow!("decode CoinbaseOutputConstraints: {:?}", e))?;
 
-    info!(
+    debug!(
         peer = %peer,
         inbound = %constraints,
         msg_type = mt,
@@ -698,7 +698,7 @@ async fn run_template_distribution_init(
 
     let persisted = SessionConstraints::from_sv2(&constraints);
     store_session_constraints(&session_constraints, persisted);
-    info!(
+    debug!(
         peer = %peer,
         coinbase_output_max_additional_size = persisted.coinbase_output_max_additional_size,
         coinbase_output_max_additional_sigops = persisted.coinbase_output_max_additional_sigops,
@@ -714,7 +714,7 @@ async fn run_template_distribution_init(
             send_template_pair(stream, transport_state, &snapshot, peer).await?;
             insert_template_id_cache(&template_cache, &snapshot);
 
-            info!(
+            debug!(
                 peer = %peer,
                 template_id = snapshot.template_id,
                 height = tmpl.height,
@@ -790,7 +790,7 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
     peer: SocketAddr,
 ) -> Result<()> {
     let tmpl = &snapshot.template;
-    info!(
+    debug!(
         peer = %peer,
         template_id = snapshot.template_id,
         height = tmpl.height,
@@ -864,7 +864,7 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         .try_into()
         .map_err(|e| anyhow!("B064K coinbase_tx_outputs: {:?}", e))?;
 
-    info!(
+    debug!(
         peer = %peer,
         template_id,
         height = tmpl.height,
@@ -888,11 +888,11 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         merkle_path,
     };
 
-    info!(
+    trace!(
         peer = %peer,
         template_id,
         msg_type = MESSAGE_TYPE_NEW_TEMPLATE,
-        "send_template_pair: calling write_td_frame for NewTemplate (sending NewTemplate)"
+        "send_template_pair: calling write_td_frame for NewTemplate"
     );
     write_td_frame(
         stream,
@@ -913,10 +913,10 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         );
         e
     })?;
-    info!(
+    trace!(
         peer = %peer,
         template_id,
-        "send_template_pair: NewTemplate wire completed (sent NewTemplate checkpoint)"
+        "send_template_pair: NewTemplate wire phase complete"
     );
 
     let set_prev = SetNewPrevHash {
@@ -927,11 +927,11 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         target: U256::from(target),
     };
 
-    info!(
+    trace!(
         peer = %peer,
         template_id,
         msg_type = MESSAGE_TYPE_SET_NEW_PREV_HASH,
-        "send_template_pair: calling write_td_frame for SetNewPrevHash (sending SetNewPrevHash)"
+        "send_template_pair: calling write_td_frame for SetNewPrevHash"
     );
     write_td_frame(
         stream,
@@ -952,10 +952,10 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         );
         e
     })?;
-    info!(
+    trace!(
         peer = %peer,
         template_id,
-        "send_template_pair: SetNewPrevHash wire completed (sent SetNewPrevHash checkpoint)"
+        "send_template_pair: SetNewPrevHash wire phase complete"
     );
 
     info!(
@@ -983,7 +983,7 @@ where
     T: Serialize + GetSize,
 {
     let ext = COMMON_MSG_EXTENSION_TYPE;
-    info!(
+    trace!(
         peer = %peer,
         msg_type,
         extension_type = ext,
@@ -1021,7 +1021,7 @@ where
             return Err(err);
         }
     };
-    info!(
+    trace!(
         peer = %peer,
         msg_type,
         phase = "before_tcp_write",
@@ -1047,7 +1047,7 @@ where
         );
         return Err(e.into());
     }
-    info!(
+    trace!(
         peer = %peer,
         msg_type,
         extension_type = ext,
@@ -1163,7 +1163,7 @@ fn block_bytes_from_submit_solution(
     let tmpl = &snapshot.template;
     let coinbase: Transaction =
         deserialize(coinbase_raw).context("deserialize SubmitSolution.coinbase_tx")?;
-    info!(
+    debug!(
         submitted_template_id = sol_template_id,
         resolved_template_height = tmpl.height,
         resolved_previous_block_hash = %tmpl.previous_block_hash,
@@ -1186,7 +1186,7 @@ fn block_bytes_from_submit_solution(
         .unwrap_or(false);
     let decoded_coinbase_height =
         first_input.and_then(|txin| decode_bip34_coinbase_height(txin.script_sig.as_bytes()));
-    info!(
+    trace!(
         coinbase_txid = %coinbase.compute_txid(),
         is_coinbase = coinbase.is_coinbase(),
         first_input_prevout = %first_input_prevout,
@@ -1261,7 +1261,7 @@ async fn log_and_dispatch_post_init_sv2_frame(
         && !channel_msg
         && msg_type == MESSAGE_TYPE_REQUEST_TRANSACTION_DATA
     {
-        info!(
+        trace!(
             peer = %peer,
             msg_type,
             msg_type_hex = "0x73",
@@ -1294,7 +1294,7 @@ async fn log_and_dispatch_post_init_sv2_frame(
                                 return;
                             }
                         };
-                        info!(
+                        debug!(
                             peer = %peer,
                             template_id,
                             tx_count = snapshot.template.transactions.len(),
@@ -1386,7 +1386,7 @@ async fn log_and_dispatch_post_init_sv2_frame(
         && !channel_msg
         && msg_type == MESSAGE_TYPE_SUBMIT_SOLUTION
     {
-        info!(
+        trace!(
             peer = %peer,
             msg_type = msg_type,
             msg_type_hex = "0x76",
@@ -1420,7 +1420,7 @@ async fn log_and_dispatch_post_init_sv2_frame(
                 };
                 let snapshot = match snapshot {
                     Some(snapshot) => {
-                        info!(
+                        debug!(
                             peer = %peer,
                             submitted_template_id = template_id,
                             resolved_height = snapshot.template.height,
@@ -1530,7 +1530,7 @@ async fn log_and_dispatch_post_init_sv2_frame(
         return;
     }
 
-    info!(
+    trace!(
         peer = %peer,
         cipher_bytes = cipher_bytes,
         msg_type = msg_type,
@@ -1563,7 +1563,7 @@ async fn drain_encrypted_frames_with_live_updates(
     let (write_cmd_tx, mut write_cmd_rx) = mpsc::unbounded_channel::<SessionWriteCommand>();
 
     tokio::spawn(async move {
-        info!(
+        debug!(
             peer = %peer_w,
             "SV2 live template writer task started with dedicated write codec state"
         );
@@ -1625,12 +1625,12 @@ async fn drain_encrypted_frames_with_live_updates(
                 }
                 recv_result = upd_rx.recv() => match recv_result {
                 Ok(payload) => {
-                    info!(
+                    trace!(
                         peer = %peer_w,
                         template_id = payload.snapshot.template_id,
                         height = payload.snapshot.template.height,
                         prev_hash = %payload.snapshot.template.previous_block_hash,
-                        "SV2 live template writer: received broadcast payload (recv Ok)"
+                        "SV2 live template writer: received broadcast payload"
                     );
                     let first_template_id = payload.snapshot.template_id;
                     let first_height = payload.snapshot.template.height;
@@ -1658,7 +1658,7 @@ async fn drain_encrypted_frames_with_live_updates(
                         }
                     }
                     let latest_template_id = latest_payload.snapshot.template_id;
-                    info!(
+                    trace!(
                         peer = %peer_w,
                         first_template_id,
                         first_height,
@@ -1667,24 +1667,24 @@ async fn drain_encrypted_frames_with_live_updates(
                         skipped_intermediate = drained_after_first.saturating_sub(1),
                         "SV2 live writer: coalesced queued template updates"
                     );
-                    info!(
+                    trace!(
                         peer = %peer_w,
                         template_id = latest_template_id,
                         height = latest_payload.snapshot.template.height,
                         prev_hash = %latest_payload.snapshot.template.previous_block_hash,
                         "Template update dequeued for SV2 session"
                     );
-                    info!(
+                    trace!(
                         peer = %peer_w,
                         template_id = latest_template_id,
                         height = latest_payload.snapshot.template.height,
                         "SV2 live writer: using dedicated write codec state"
                     );
-                    info!(
+                    trace!(
                         peer = %peer_w,
                         template_id = latest_template_id,
                         height = latest_payload.snapshot.template.height,
-                        "SV2 live writer: calling send_template_pair"
+                        "SV2 live writer: invoking send_template_pair"
                     );
                     let current_constraints = load_session_constraints(&sc_writer);
                     if let Err(reason) = validate_template_under_constraints(
@@ -1705,7 +1705,7 @@ async fn drain_encrypted_frames_with_live_updates(
                             "Live template rejected by CoinbaseOutputConstraints gate; skipping NewTemplate/SetNewPrevHash"
                         );
                         if exit_after_send {
-                            info!(
+                            debug!(
                                 peer = %peer_w,
                                 reason = "broadcast_closed",
                                 "SV2 live template writer task: recv loop exiting"
@@ -1724,14 +1724,14 @@ async fn drain_encrypted_frames_with_live_updates(
                     {
                         Ok(()) => {
                             insert_template_id_cache(&tc_writer, &latest_payload.snapshot);
-                            info!(
+                            trace!(
                                 peer = %peer_w,
                                 template_id = latest_template_id,
                                 height = latest_payload.snapshot.template.height,
                                 "SV2 live writer: send_template_pair completed Ok"
                             );
                             if exit_after_send {
-                                info!(
+                                debug!(
                                     peer = %peer_w,
                                     reason = "broadcast_closed",
                                     "SV2 live template writer task: recv loop exiting"
@@ -1753,7 +1753,7 @@ async fn drain_encrypted_frames_with_live_updates(
                                 "SV2 live template push failed: {:#}",
                                 e
                             );
-                            info!(
+                            debug!(
                                 peer = %peer_w,
                                 reason = "send_template_pair_error_after_live_payload",
                                 template_id = latest_template_id,
@@ -1772,7 +1772,7 @@ async fn drain_encrypted_frames_with_live_updates(
                     );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    info!(
+                    debug!(
                         peer = %peer_w,
                         reason = "broadcast_closed",
                         "SV2 live template writer task: recv loop exiting"
@@ -1782,13 +1782,13 @@ async fn drain_encrypted_frames_with_live_updates(
             }
             }
         }
-        info!(
+        debug!(
             peer = %peer_w,
             "SV2 live template writer task ended"
         );
     });
 
-    info!(
+    debug!(
         peer = %peer,
         "Session read loop with live template push (post-SetupConnection); using dedicated read codec state"
     );
@@ -1911,7 +1911,7 @@ async fn send_setup_connection_error(
         .await
         .context("failed to send SetupConnectionError")?;
     stream.flush().await?;
-    info!(
+    debug!(
         extension_type = extension_type_base,
         error_code = %error_code,
         flags,
@@ -1930,7 +1930,10 @@ async fn drain_encrypted_frames(
     template_rx: watch::Receiver<Option<TemplateSnapshot>>,
     template_cache: TemplateIdCache,
 ) -> Result<()> {
-    info!(peer = %peer, "Session idle read loop (post-SetupConnection; payloads not decoded)");
+    debug!(
+        peer = %peer,
+        "Session idle read loop (post-SetupConnection; payloads not decoded)"
+    );
 
     loop {
         match read_encrypted_sv2_frame(stream, decoder, state, peer).await {
