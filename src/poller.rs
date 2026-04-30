@@ -53,7 +53,13 @@ pub async fn run(
         let rpc_template = match client.get_block_template().await {
             Ok(t) => t,
             Err(e) => {
-                error!(poll = poll_count, "Failed to get block template: {:#}", e);
+                error!(
+                    event = "azcoin_rpc_error",
+                    method = "getblocktemplate",
+                    poll = poll_count,
+                    "RPC getblocktemplate failed: {:#}",
+                    e
+                );
                 continue;
             }
         };
@@ -63,25 +69,35 @@ pub async fn run(
         match previous.as_ref().map(|p| &p.template) {
             None => {
                 info!(
+                    event = "template_changed",
+                    change_kind = "first_poll_precache",
                     poll         = poll_count,
                     height       = template.height,
+                    template_id_known = false,
                     version      = template.version,
-                    prev_hash    = %template.previous_block_hash,
+                    previous_block_hash    = %template.previous_block_hash,
                     bits         = %template.bits,
                     tx_count     = template.transactions.len(),
                     coinbase     = template.coinbase_value,
                     total_fees   = template.total_fees(),
                     total_weight = template.total_weight(),
-                    "Initial template received"
+                    witness_commitment_included = template.witness_commitment_included(),
+                    coinbase_output_count = template.sv2_placeholder_coinbase_output_count(),
+                    "Initial template from node (SV2 template_id assigned after fingerprint step)"
                 );
             }
             Some(prev) => match template.describe_change(prev) {
                 Some(description) => {
                     info!(
+                        event = "template_changed",
+                        change_kind = "describe_change",
                         poll      = poll_count,
+                        prior_template_id = ?previous.as_ref().map(|s| s.template_id),
                         height    = template.height,
-                        prev_hash = %template.previous_block_hash,
-                        "Template changed: {}",
+                        previous_block_hash = %template.previous_block_hash,
+                        witness_commitment_included = template.witness_commitment_included(),
+                        coinbase_output_count = template.sv2_placeholder_coinbase_output_count(),
+                        "{}",
                         description
                     );
                 }
@@ -106,13 +122,28 @@ pub async fn run(
                 template_id,
                 template: template.clone(),
             };
-            if last_push_fp.is_some() {
+            if last_push_fp.is_none() {
                 info!(
+                    event = "template_loaded",
+                    poll = poll_count,
+                    template_id = snapshot.template_id,
+                    height = template.height,
+                    previous_block_hash = %template.previous_block_hash,
+                    witness_commitment_included = template.witness_commitment_included(),
+                    coinbase_output_count = template.sv2_placeholder_coinbase_output_count(),
+                    "GBT template promoted to tracked SV2 snapshot"
+                );
+            } else {
+                info!(
+                    event = "template_changed",
+                    change_kind = "sv2_push_fingerprint",
                     poll = poll_count,
                     height = template.height,
-                    prev_hash = %template.previous_block_hash,
+                    previous_block_hash = %template.previous_block_hash,
                     fingerprint = fp,
                     template_id = snapshot.template_id,
+                    witness_commitment_included = template.witness_commitment_included(),
+                    coinbase_output_count = template.sv2_placeholder_coinbase_output_count(),
                     "Template change detected (SV2 push fingerprint)"
                 );
             }

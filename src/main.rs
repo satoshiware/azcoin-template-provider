@@ -26,11 +26,15 @@ struct Cli {
     /// Path to TOML configuration file.
     #[arg(short, long, default_value = "config/azcoin-template-provider.toml")]
     config: PathBuf,
+    /// Exit after validating config and verifying azcoind JSON-RPC (+ network match).
+    #[arg(long)]
+    health_check: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::SystemTime)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -60,6 +64,14 @@ async fn main() -> Result<()> {
 
     health::check_rpc_connectivity(client.as_ref(), &cfg).await?;
 
+    if cli.health_check {
+        tracing::info!(
+            event = "health_check_complete",
+            "RPC and network validated (health_check); exiting"
+        );
+        return Ok(());
+    }
+
     let (template_tx, template_rx) = tokio::sync::watch::channel(None);
     let (template_push_tx, _) = tokio::sync::broadcast::channel::<
         crate::template::TemplateUpdatePayload,
@@ -71,6 +83,18 @@ async fn main() -> Result<()> {
 
     let keys_configured =
         !cfg.authority_public_key.is_empty() && !cfg.authority_secret_key.is_empty();
+
+    tracing::info!(
+        event = "template_provider_startup",
+        version = env!("CARGO_PKG_VERSION"),
+        config_path = %cli.config.display(),
+        rpc_url = %cfg.rpc_url,
+        network = %cfg.network,
+        poll_interval_ms = cfg.poll_interval_ms,
+        tp_listen_address = %cfg.tp_listen_address,
+        sv2_tp_enabled = keys_configured,
+        "template provider wiring complete — starting main tasks"
+    );
 
     if keys_configured {
         info!(

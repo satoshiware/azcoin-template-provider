@@ -294,7 +294,13 @@ pub async fn run(
                 tokio::spawn(async move {
                     match handle_connection(stream, peer, &pk, &sk, rx, push, rpc_c).await {
                         Ok(()) => {}
-                        Err(e) => warn!(peer = %peer, "SV2 session ended: {:#}", e),
+                        Err(e) => warn!(
+                            peer = %peer,
+                            event = "pool_disconnected",
+                            reason = "session_error",
+                            "SV2 session ended: {:#}",
+                            e
+                        ),
                     }
                 });
             }
@@ -562,7 +568,8 @@ async fn handle_connection(
 
     info!(
         peer = %peer,
-        used_version,
+        event = "pool_connected",
+        negotiated_version = used_version,
         extension_type = COMMON_MSG_EXTENSION_TYPE,
         "Response sent: SetupConnectionSuccess (common-message frame; template distribution negotiated in payload)"
     );
@@ -951,7 +958,16 @@ async fn send_template_pair<W: AsyncWrite + Unpin>(
         "send_template_pair: SetNewPrevHash wire completed (sent SetNewPrevHash checkpoint)"
     );
 
-    info!(peer = %peer, template_id, "send_template_pair: completed Ok");
+    info!(
+        peer = %peer,
+        template_id,
+        height = tmpl.height,
+        previous_block_hash = %tmpl.previous_block_hash,
+        coinbase_tx_outputs_placeholder_count = coinbase_tx_outputs_count,
+        witness_commitment_included,
+        event = "template_sent",
+        "NewTemplate and SetNewPrevHash sent to pool (Template Distribution)"
+    );
     Ok(())
 }
 
@@ -1389,14 +1405,14 @@ async fn log_and_dispatch_post_init_sv2_frame(
                 let header_timestamp = sol.header_timestamp;
                 let header_nonce = sol.header_nonce;
                 info!(
+                    event = "solution_received",
                     peer = %peer,
                     template_id = template_id,
                     header_version = header_version,
                     header_timestamp = header_timestamp,
                     header_nonce = header_nonce,
                     coinbase_len = coinbase_raw.len(),
-                    decode_ok = true,
-                    "SubmitSolution decode succeeded"
+                    "SubmitSolution decoded from pool"
                 );
                 let snapshot = {
                     let m = template_cache.lock().expect("template_id cache lock");
@@ -1416,11 +1432,13 @@ async fn log_and_dispatch_post_init_sv2_frame(
                     None => {
                         let latest_id = template_rx.borrow().as_ref().map(|s| s.template_id);
                         warn!(
+                            event = "submitblock_result",
                             peer = %peer,
-                            submitted_template_id = template_id,
+                            template_id,
+                            outcome = "template_cache_miss",
                             cache_miss = true,
                             latest_known_template_id = ?latest_id,
-                            "SubmitSolution: no cached template for template_id; skipping submitblock"
+                            "Skipped submitblock — no cached template for template_id"
                         );
                         return;
                     }
@@ -1433,51 +1451,68 @@ async fn log_and_dispatch_post_init_sv2_frame(
                     &coinbase_raw,
                     &snapshot,
                 );
-                let block_hex = match block_res {
-                    Ok(bytes) => hex::encode(bytes),
+                let block_bytes = match block_res {
+                    Ok(bytes) => bytes,
                     Err(e) => {
                         warn!(
+                            event = "submitblock_result",
                             peer = %peer,
-                            template_id = template_id,
+                            template_id,
+                            outcome = "block_assembly_failed",
                             error = %e,
                             error_debug = ?e,
-                            "SubmitSolution: failed to assemble block for submitblock"
+                            "SubmitSolution: failed to assemble block bytes"
                         );
                         return;
                     }
                 };
+                let block_hash = deserialize::<Block>(&block_bytes)
+                    .map(|b| b.block_hash().to_string())
+                    .ok();
+
                 info!(
+                    event = "submitblock_called",
                     peer = %peer,
-                    template_id = template_id,
-                    block_hex_len = block_hex.len(),
-                    submitblock_invoked = true,
-                    "calling submitblock RPC"
+                    template_id,
+                    block_hash = ?block_hash,
+                    serialized_block_bytes = block_bytes.len(),
+                    "Invoking submitblock JSON-RPC"
                 );
+                let block_hex = hex::encode(&block_bytes);
                 match rpc.submit_block(&block_hex).await {
                     Ok(None) => {
                         info!(
                             peer = %peer,
-                            template_id = template_id,
+                            event = "submitblock_result",
+                            template_id,
+                            outcome = "accepted",
                             accepted = true,
-                            "submitblock: node accepted block (null result)"
+                            block_hash = ?block_hash,
+                            "submitblock succeeded (null result — block accepted)"
                         );
                     }
                     Ok(Some(reason)) => {
                         info!(
                             peer = %peer,
-                            template_id = template_id,
+                            event = "submitblock_result",
+                            template_id,
+                            outcome = "rejected_by_node",
                             accepted = false,
-                            rejection = %reason,
-                            "submitblock: node rejected block (string result)"
+                            reject_reason = %reason,
+                            block_hash = ?block_hash,
+                            "submitblock returned rejection reason string"
                         );
                     }
                     Err(e) => {
                         warn!(
                             peer = %peer,
-                            template_id = template_id,
+                            event = "submitblock_result",
+                            template_id,
+                            outcome = "rpc_transport_or_envelope_failure",
+                            block_hash = ?block_hash,
                             error = %e,
                             error_debug = ?e,
-                            "submitblock: RPC error"
+                            "submitblock RPC call failed after assembly (see also azcoin_rpc_error from client)"
                         );
                     }
                 }
@@ -1780,7 +1815,9 @@ async fn drain_encrypted_frames_with_live_updates(
                 if is_unexpected_eof(&e) {
                     info!(
                         peer = %peer,
-                        reason = "unexpected_eof",
+                        event = "pool_disconnected",
+                        reason = "tcp_closed",
+                        detail = "unexpected_eof_on_read",
                         "Session read loop exiting (SV2 client disconnected)"
                     );
                     return Ok(());
@@ -1788,6 +1825,7 @@ async fn drain_encrypted_frames_with_live_updates(
                 warn!(
                     peer = %peer,
                     reason = "read_or_decode_error",
+                    event = "pool_disconnected",
                     "Session read loop exiting on error: {:#}",
                     e
                 );
@@ -1911,7 +1949,13 @@ async fn drain_encrypted_frames(
             }
             Err(e) => {
                 if is_unexpected_eof(&e) {
-                    info!(peer = %peer, "SV2 client disconnected");
+                    info!(
+                        peer = %peer,
+                        event = "pool_disconnected",
+                        reason = "tcp_closed",
+                        detail = "unexpected_eof_on_idle_drain",
+                        "SV2 client disconnected"
+                    );
                     return Ok(());
                 }
                 warn!(peer = %peer, "SV2 read/decode error: {:#}", e);

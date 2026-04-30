@@ -67,6 +67,101 @@ pool_sv2
 translator / miners
 ```
 
+---
+
+## Deployment model (source vs live super-node layout)
+
+Development and builds happen in this repository only. Typical **live** installs on an AZCoin super-node host use:
+
+| Concept | Production path |
+|--------|-------------------|
+| Installed Template Provider binary | `/opt/azcoin-super/templar/bin/azcoin-template-provider` |
+| Installed config | `/etc/azcoin-super/templar/azcoin-template-provider.toml` |
+| systemd unit | `azcoin-template-provider.service` |
+| Service user | `azcoin-templar` |
+
+The Template Provider stays **co-resident** with the local SV2 pool for the MVP (`127.0.0.1` or LAN). Configuration should use configurable listen/bind addresses (`tp_listen_address`, pool upstream) rather than assuming the pool will always be local.
+
+**This README does not configure `/opt`, `/etc`, or systemd.** Copy artifacts from your CI or release build outputs.
+
+---
+
+### Safe manual install / update (run on the deployment host — not from CI)
+
+Adjust paths only if your site uses different layout.
+
+```bash
+# Build (on a builder or checkout)
+cargo build --release
+# Artifact: ./target/release/azcoin-template-provider
+
+# Install binary (requires appropriate privileges)
+sudo install -o root -g root -m 0755 \
+  target/release/azcoin-template-provider \
+  /opt/azcoin-super/templar/bin/azcoin-template-provider
+
+# Config: copy the example ONLY when creating a fresh config (do not overwrite secrets)
+sudo install -o root -g azcoin-templar -m 0640 \
+  config/azcoin-template-provider.toml.example \
+  /etc/azcoin-super/templar/azcoin-template-provider.toml.new
+# Then merge settings into your real file and remove *.new once satisfied.
+
+sudo systemctl restart azcoin-template-provider.service
+sudo systemctl status azcoin-template-provider.service --no-pager
+sudo journalctl -u azcoin-template-provider.service -n 120 --no-pager
+sudo journalctl -u azcoin-template-provider.service -f
+```
+
+Prefer `install`/`cp` with explicit modes; restart only after validating config.
+
+---
+
+### Readiness / health check CLI
+
+There is **no HTTP health server** by design.
+
+- **`--health-check`** — Loads the TOML config (via `--config` if set), verifies JSON-RPC connectivity, chain name (`network`), and exits **0** on success without starting polling or SV2 listener. Intended for scripted probes (e.g. `ExecStartPost` wrappers, Consul, Prometheus blackbox exporter via script).
+
+```bash
+./target/release/azcoin-template-provider --health-check \
+  --config /etc/azcoin-super/templar/azcoin-template-provider.toml
+```
+
+**Follow-up (optional):** A dedicated `SIGUSR`-triggered readiness file or NOTIFY socket could extend observability without new frameworks; `--health-check` is the smallest in-process check today.
+
+---
+
+### Structured log events
+
+Logs use `tracing` with the default human-readable formatter and wall-clock **timestamps on each line** (`tracing_subscriber::fmt::time::SystemTime`). Filter or ship logs by the stable **`event`** field where present:
+
+| `event` | Meaning |
+|---------|---------|
+| `template_provider_startup` | Main services about to run (channels ready, SV2 mode flag set). |
+| `rpc_connectivity_ready` | Startup JSON-RPC handshake and `network` verification succeeded (`health`). |
+| `health_check_complete` | `--health-check` ran successfully before exit. |
+| `pool_connected` | SV2 SetupConnection negotiated; Template Distribution channel ready (`peer`). |
+| `pool_disconnected` | Session ended (TCP hangup, EOF, decode failure, handler error — see `reason` / `detail`). |
+| `template_loaded` | First GBT snapshot received an SV2 `template_id`. |
+| `template_changed` | Template differs from prior (poller semantics; see `change_kind`). |
+| `template_sent` | `NewTemplate` + `SetNewPrevHash` written to SV2 (`peer`, `template_id`, `previous_block_hash`, placeholder output count, witness flag). |
+| `solution_received` | `SubmitSolution` decoded (`peer`, `template_id`). |
+| `submitblock_called` | About to invoke `submitblock` (`block_hash` if derivation from assembled block succeeded). |
+| `submitblock_result` | Outcome (`outcome`: `accepted`, `rejected_by_node`, `rpc_transport_or_envelope_failure`, `block_assembly_failed`, `template_cache_miss`; `reject_reason` when rejected). |
+| `azcoin_rpc_error` | JSON-RPC/HTTP/deserialization failure (**passwords never logged**). |
+
+Template-related events include **`template_id`**, **`height`**, **`previous_block_hash`**, and where applicable **`witness_commitment_included`**, **`coinbase_output_count`** (SV2 **placeholder** output count before pool reserved space).
+
+---
+
+### Journal examples (grep on `event=`)
+
+```bash
+sudo journalctl -u azcoin-template-provider.service -f --no-pager | grep event=
+```
+
+---
+
 **Repository layout:**
 
 ```
@@ -165,7 +260,7 @@ Add `config/azcoin-template-provider.toml` to `.gitignore` if it holds secrets.
 
 ```bash
 cargo build --release
-cargo test    # 25 unit tests (config, RPC submitblock results, template change detection, constraints, tx-data responses)
+cargo test    # unit tests (config, RPC, template, constraints, tx-data responses)
 ```
 
 ```bash
@@ -173,6 +268,8 @@ cargo run
 # or
 cargo run -- --config /path/to/config.toml
 RUST_LOG=debug cargo run
+# One-shot RPC readiness (exits immediately; systemd-friendly)
+cargo run --release -- --health-check --config /path/to/config.toml
 ```
 
 If authority keys are empty, the service runs **poller-only** (no SV2 listener).

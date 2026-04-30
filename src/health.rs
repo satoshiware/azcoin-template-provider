@@ -44,9 +44,10 @@ pub async fn check_rpc_connectivity(client: &RpcClient, config: &Config) -> Resu
     }
 
     info!(
+        event = "rpc_connectivity_ready",
         network = %config.network,
         template_rules = ?config.template_rules,
-        "Health check passed"
+        "Startup JSON-RPC connectivity and chain name validated"
     );
 
     Ok(())
