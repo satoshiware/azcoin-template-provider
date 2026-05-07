@@ -2,8 +2,8 @@
 //!
 //! Calls `getblocktemplate` every `poll_interval_ms` milliseconds, converts
 //! the raw RPC response into an [`AzcoinTemplate`], and compares it to the
-//! previous template.  Changes are logged at `INFO`; identical templates are
-//! logged at `DEBUG`.
+//! previous template.  Stable `event=` fields are emitted at **`INFO`**; redundant
+//! broadcaster bookkeeping logs are **`DEBUG`**. Identical consecutive templates stay **`DEBUG`**.
 //!
 //! Each new template is published through a [`tokio::sync::watch`] channel so
 //! [`crate::tp_server`] always has the latest snapshot. **On meaningful change**
@@ -44,7 +44,10 @@ pub async fn run(
     let mut next_template_id: u64 = 1;
     let mut poll_count: u64 = 0;
 
-    info!(interval_ms = poll_interval_ms, "Starting template poller");
+    debug!(
+        interval_ms = poll_interval_ms,
+        "Starting template poller loop"
+    );
 
     loop {
         ticker.tick().await;
@@ -53,7 +56,13 @@ pub async fn run(
         let rpc_template = match client.get_block_template().await {
             Ok(t) => t,
             Err(e) => {
-                error!(poll = poll_count, "Failed to get block template: {:#}", e);
+                error!(
+                    event = "azcoin_rpc_error",
+                    method = "getblocktemplate",
+                    poll = poll_count,
+                    "RPC getblocktemplate failed: {:#}",
+                    e
+                );
                 continue;
             }
         };
@@ -63,25 +72,35 @@ pub async fn run(
         match previous.as_ref().map(|p| &p.template) {
             None => {
                 info!(
+                    event = "template_changed",
+                    change_kind = "first_poll_precache",
                     poll         = poll_count,
                     height       = template.height,
+                    template_id_known = false,
                     version      = template.version,
-                    prev_hash    = %template.previous_block_hash,
+                    previous_block_hash    = %template.previous_block_hash,
                     bits         = %template.bits,
                     tx_count     = template.transactions.len(),
                     coinbase     = template.coinbase_value,
                     total_fees   = template.total_fees(),
                     total_weight = template.total_weight(),
-                    "Initial template received"
+                    witness_commitment_included = template.witness_commitment_included(),
+                    coinbase_output_count = template.sv2_placeholder_coinbase_output_count(),
+                    "Initial template from node (SV2 template_id assigned after fingerprint step)"
                 );
             }
             Some(prev) => match template.describe_change(prev) {
                 Some(description) => {
                     info!(
+                        event = "template_changed",
+                        change_kind = "describe_change",
                         poll      = poll_count,
+                        prior_template_id = ?previous.as_ref().map(|s| s.template_id),
                         height    = template.height,
-                        prev_hash = %template.previous_block_hash,
-                        "Template changed: {}",
+                        previous_block_hash = %template.previous_block_hash,
+                        witness_commitment_included = template.witness_commitment_included(),
+                        coinbase_output_count = template.sv2_placeholder_coinbase_output_count(),
+                        "{}",
                         description
                     );
                 }
@@ -106,19 +125,34 @@ pub async fn run(
                 template_id,
                 template: template.clone(),
             };
-            if last_push_fp.is_some() {
+            if last_push_fp.is_none() {
                 info!(
+                    event = "template_loaded",
+                    poll = poll_count,
+                    template_id = snapshot.template_id,
+                    height = template.height,
+                    previous_block_hash = %template.previous_block_hash,
+                    witness_commitment_included = template.witness_commitment_included(),
+                    coinbase_output_count = template.sv2_placeholder_coinbase_output_count(),
+                    "GBT template promoted to tracked SV2 snapshot"
+                );
+            } else {
+                info!(
+                    event = "template_changed",
+                    change_kind = "sv2_push_fingerprint",
                     poll = poll_count,
                     height = template.height,
-                    prev_hash = %template.previous_block_hash,
+                    previous_block_hash = %template.previous_block_hash,
                     fingerprint = fp,
                     template_id = snapshot.template_id,
+                    witness_commitment_included = template.witness_commitment_included(),
+                    coinbase_output_count = template.sv2_placeholder_coinbase_output_count(),
                     "Template change detected (SV2 push fingerprint)"
                 );
             }
             let old_height = previous.as_ref().map(|p| p.template.height);
             let receiver_count = template_push_tx.receiver_count();
-            info!(
+            debug!(
                 poll = poll_count,
                 old_height = ?old_height,
                 new_height = template.height,
@@ -126,34 +160,34 @@ pub async fn run(
                 new_fingerprint = fp,
                 template_id = snapshot.template_id,
                 receiver_count = receiver_count,
-                "SV2 live broadcast: about to send (pre-send instrumentation)"
+                "SV2 broadcast queue: enqueue template update"
             );
             let send_result = template_push_tx.send(TemplateUpdatePayload {
                 snapshot: snapshot.clone(),
             });
             match &send_result {
-                Ok(n_receivers) => info!(
+                Ok(n_receivers) => debug!(
                     poll = poll_count,
                     template_id = snapshot.template_id,
                     receivers_notified = *n_receivers,
                     result = "Ok",
-                    "SV2 live broadcast: send result"
+                    "SV2 broadcast: send_complete"
                 ),
-                Err(e) => info!(
+                Err(e) => debug!(
                     poll = poll_count,
                     template_id = snapshot.template_id,
                     result = "Err",
                     error = ?e,
-                    "SV2 live broadcast: send result"
+                    "SV2 broadcast: send_complete"
                 ),
             }
             match send_result {
-                Ok(n) => info!(
+                Ok(n) => debug!(
                     poll = poll_count,
                     receivers = n,
                     template_id = snapshot.template_id,
                     height = template.height,
-                    "Template update queued for SV2 pool sessions"
+                    "SV2 broadcast: template update dispatched to subscribed sessions"
                 ),
                 Err(_) => debug!(
                     poll = poll_count,

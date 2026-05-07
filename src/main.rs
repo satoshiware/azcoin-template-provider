@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Capacity for `tokio::sync::broadcast` used to push live template updates to SV2 sessions.
 /// Larger depth reduces `RecvError::Lagged` / drops when many templates arrive in a burst (0.2.0).
@@ -26,11 +26,15 @@ struct Cli {
     /// Path to TOML configuration file.
     #[arg(short, long, default_value = "config/azcoin-template-provider.toml")]
     config: PathBuf,
+    /// Exit after validating config and verifying azcoind JSON-RPC (+ network match).
+    #[arg(long)]
+    health_check: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::SystemTime)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -39,14 +43,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    info!(path = %cli.config.display(), "Loading configuration");
+    debug!(path = %cli.config.display(), "Loading configuration");
     let cfg = config::Config::load(&cli.config)?;
-    info!(
+    debug!(
         rpc_url  = %cfg.rpc_url,
         network  = %cfg.network,
         poll_ms  = cfg.poll_interval_ms,
         tp_addr  = %cfg.tp_listen_address,
-        "Configuration loaded"
+        "Configuration deserialized and validated"
     );
 
     let client = Arc::new(
@@ -60,22 +64,42 @@ async fn main() -> Result<()> {
 
     health::check_rpc_connectivity(client.as_ref(), &cfg).await?;
 
+    if cli.health_check {
+        tracing::info!(
+            event = "health_check_complete",
+            "RPC and network validated (health_check); exiting"
+        );
+        return Ok(());
+    }
+
     let (template_tx, template_rx) = tokio::sync::watch::channel(None);
     let (template_push_tx, _) = tokio::sync::broadcast::channel::<
         crate::template::TemplateUpdatePayload,
     >(TEMPLATE_BROADCAST_BUFFER_DEPTH);
-    info!(
+    debug!(
         template_broadcast_buffer_depth = TEMPLATE_BROADCAST_BUFFER_DEPTH,
-        "Template broadcast buffer configured"
+        "Template broadcast channel initialized"
     );
 
     let keys_configured =
         !cfg.authority_public_key.is_empty() && !cfg.authority_secret_key.is_empty();
 
+    tracing::info!(
+        event = "template_provider_startup",
+        version = env!("CARGO_PKG_VERSION"),
+        config_path = %cli.config.display(),
+        rpc_url = %cfg.rpc_url,
+        network = %cfg.network,
+        poll_interval_ms = cfg.poll_interval_ms,
+        tp_listen_address = %cfg.tp_listen_address,
+        sv2_tp_enabled = keys_configured,
+        "template provider wiring complete — starting main tasks"
+    );
+
     if keys_configured {
-        info!(
+        debug!(
             tp_address = %cfg.tp_listen_address,
-            "Starting SV2 Template Provider (Noise-authenticated)"
+            "Starting SV2 listener + poller (Noise-authenticated Template Distribution)"
         );
         let push = template_push_tx.clone();
         let rpc_tp = client.clone();

@@ -244,6 +244,21 @@ impl AzcoinTemplate {
         self.transactions.iter().map(|tx| tx.weight).sum()
     }
 
+    /// Whether GBT exposed a SegWit-style commitment placeholder for SV2 [`NewTemplate`].
+    pub fn witness_commitment_included(&self) -> bool {
+        self.default_witness_commitment.is_some()
+    }
+
+    /// Count of fixed (TP-side) placeholder coinbase outputs encoded in [`NewTemplate`]
+    /// before pool-controlled additional outputs (`0` or `1`).
+    pub fn sv2_placeholder_coinbase_output_count(&self) -> u32 {
+        if self.witness_commitment_included() {
+            1
+        } else {
+            0
+        }
+    }
+
     /// Compare two templates and return a human-readable description of what
     /// changed.  Returns `None` when nothing meaningful differs (`curtime`
     /// changes alone are ignored).
@@ -532,6 +547,25 @@ mod tests {
             msg.contains("txs 1 -> 2"),
             "should show tx count change, got: {msg}"
         );
+    }
+
+    #[test]
+    fn witness_placeholder_outputs_track_commitment_presence() {
+        let tmpl = make_template(
+            200,
+            "aaaa0000bbbb1111cccc2222dddd3333eeee4444ffff5555aaaa0000bbbb1111",
+            5_000_000_000,
+            &[],
+        );
+        assert!(!tmpl.witness_commitment_included());
+        assert_eq!(tmpl.sv2_placeholder_coinbase_output_count(), 0);
+
+        let tmpl_w = AzcoinTemplate {
+            default_witness_commitment: Some("6aa".into()),
+            ..tmpl.clone()
+        };
+        assert!(tmpl_w.witness_commitment_included());
+        assert_eq!(tmpl_w.sv2_placeholder_coinbase_output_count(), 1);
     }
 
     #[test]

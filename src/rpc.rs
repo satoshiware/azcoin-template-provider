@@ -22,6 +22,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::template::{RpcBlockHeader, RpcBlockTemplate, RpcBlockchainInfo};
 
@@ -93,11 +94,26 @@ impl RpcClient {
             .json(&body)
             .send()
             .await
+            .map_err(|e| {
+                warn!(
+                    event = "azcoin_rpc_error",
+                    method = %method,
+                    error = %e,
+                    "HTTP transport failed before response (check node reachability)"
+                );
+                e
+            })
             .with_context(|| format!("HTTP request for RPC method '{}' failed", method))?;
 
         let status = http_resp.status();
         if !status.is_success() {
             let text = http_resp.text().await.unwrap_or_default();
+            warn!(
+                event = "azcoin_rpc_error",
+                method = %method,
+                http_status = %status,
+                "RPC HTTP error (body omitted)"
+            );
             return Err(anyhow!(
                 "RPC '{}' returned HTTP {}: {}",
                 method,
@@ -109,9 +125,25 @@ impl RpcClient {
         let rpc_resp: JsonRpcResponse = http_resp
             .json()
             .await
+            .map_err(|e| {
+                warn!(
+                    event = "azcoin_rpc_error",
+                    method = %method,
+                    error = %e,
+                    "Failed to deserialize JSON-RPC HTTP body"
+                );
+                e
+            })
             .with_context(|| format!("failed to deserialize JSON-RPC envelope for '{}'", method))?;
 
         if let Some(e) = rpc_resp.error {
+            warn!(
+                event = "azcoin_rpc_error",
+                method = %method,
+                code = e.code,
+                message = %e.message,
+                "JSON-RPC error field set"
+            );
             return Err(anyhow!(
                 "RPC '{}' error [{}]: {}",
                 method,
@@ -122,6 +154,15 @@ impl RpcClient {
 
         serde_json::from_value(rpc_resp.result)
             .with_context(|| format!("failed to deserialize result for RPC '{}'", method))
+            .map_err(|e| {
+                warn!(
+                    event = "azcoin_rpc_error",
+                    method = %method,
+                    error = %e,
+                    "Failed to deserialize RPC result JSON"
+                );
+                e
+            })
     }
 
     // ---- public RPC wrappers ------------------------------------------------
