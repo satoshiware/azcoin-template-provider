@@ -3,7 +3,7 @@
 //! Called once before the polling loop begins.  Verifies that:
 //!
 //! 1. `azcoind` is reachable over JSON-RPC.
-//! 2. The node's reported chain name matches the configured `network`.
+//! 2. The node's reported chain name matches [`crate::config::AZCOIN_EXPECTED_CHAIN`].
 //! 3. The node is not still in initial block download (warning only).
 //!
 //! If any hard check fails, the service exits with a clear error message
@@ -12,12 +12,12 @@
 use anyhow::{bail, Result};
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::config::{azcoin_template_rules_vec, Config, AZCOIN_EXPECTED_CHAIN};
 use crate::rpc::RpcClient;
 
 /// Verify RPC connectivity and validate chain/network agreement.
-pub async fn check_rpc_connectivity(client: &RpcClient, config: &Config) -> Result<()> {
-    debug!(url = %config.rpc_url, "Calling getblockchaininfo for startup check");
+pub async fn check_rpc_connectivity(client: &RpcClient, _config: &Config) -> Result<()> {
+    debug!(url = %_config.rpc_url, "Calling getblockchaininfo for startup check");
 
     let info = client.get_blockchain_info().await?;
 
@@ -31,10 +31,10 @@ pub async fn check_rpc_connectivity(client: &RpcClient, config: &Config) -> Resu
         "getblockchaininfo response"
     );
 
-    if info.chain != config.network {
+    if info.chain != AZCOIN_EXPECTED_CHAIN {
         bail!(
-            "network mismatch: config expects '{}' but azcoind reports '{}'",
-            config.network,
+            "AZCoin Core chain mismatch: expected {}, got {}",
+            AZCOIN_EXPECTED_CHAIN,
             info.chain
         );
     }
@@ -45,9 +45,9 @@ pub async fn check_rpc_connectivity(client: &RpcClient, config: &Config) -> Resu
 
     info!(
         event = "rpc_connectivity_ready",
-        network = %config.network,
-        template_rules = ?config.template_rules,
-        "Startup JSON-RPC connectivity and chain name validated"
+        expected_network = AZCOIN_EXPECTED_CHAIN,
+        template_rules = ?azcoin_template_rules_vec(),
+        "Startup JSON-RPC connectivity and chain name validated (rules are binary-built, not from TOML)"
     );
 
     Ok(())

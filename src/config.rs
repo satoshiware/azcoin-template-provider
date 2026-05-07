@@ -1,8 +1,8 @@
 //! TOML configuration loading for the azcoin-template-provider service.
 //!
-//! The config file is the single source of truth for all runtime settings:
-//! RPC connection details, polling interval, target network, template
-//! request rules, and TP listener address.
+//! The config file holds RPC connection details, polling interval, optional ZMQ,
+//! and TP listener address. **Chain name and `getblocktemplate` rules are
+//! compiled into the binary** for AZCOIN production (`main` + `segwit`).
 //! See `config/azcoin-template-provider.toml.example` for a fully-commented
 //! reference.
 
@@ -11,10 +11,25 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Expected [`getblockchaininfo.chain`] for AZCOIN production Template Provider.
+pub const AZCOIN_EXPECTED_CHAIN: &str = "main";
+
+/// BIP rules always included in every `getblocktemplate` request (hardcoded).
+pub const AZCOIN_TEMPLATE_RULES: [&str; 1] = ["segwit"];
+
+/// Rules list for RPC construction (owned strings).
+pub fn azcoin_template_rules_vec() -> Vec<String> {
+    AZCOIN_TEMPLATE_RULES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 /// Top-level configuration, deserialized from a TOML file.
 ///
-/// Required fields: `rpc_url`, `rpc_user`, `rpc_password`,
-/// `poll_interval_ms`, `network`.  All others have sensible defaults.
+/// Required fields: `rpc_url`, `rpc_user`, `rpc_password`, `poll_interval_ms`.
+/// Legacy keys such as `network` or `template_rules` in existing TOML files are
+/// **ignored** by serde (not part of this struct).
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     /// JSON-RPC endpoint of `azcoind`, e.g. `http://127.0.0.1:8332`.
@@ -25,14 +40,6 @@ pub struct Config {
     pub rpc_password: String,
     /// Milliseconds between consecutive `getblocktemplate` polls (minimum 100).
     pub poll_interval_ms: u64,
-    /// Expected chain name, validated against `getblockchaininfo.chain`.
-    pub network: String,
-    /// BIP feature rules to include in the `getblocktemplate` request object.
-    /// Left empty by default for maximum AZCOIN compatibility — the node will
-    /// return a template without assuming any soft-fork features.
-    /// Set to `["segwit"]` only if the chain has SegWit activated.
-    #[serde(default)]
-    pub template_rules: Vec<String>,
     /// TCP address for the SV2 Template Provider listener,
     /// e.g. `"0.0.0.0:8442"`.
     #[serde(default = "default_tp_listen_address")]
@@ -113,7 +120,6 @@ impl Config {
             "poll_interval_ms must be >= 100 (got {})",
             self.poll_interval_ms
         );
-        anyhow::ensure!(!self.network.is_empty(), "network must not be empty");
         if self.zmq_enabled {
             anyhow::ensure!(
                 !self.zmq_endpoint.trim().is_empty(),
@@ -146,14 +152,14 @@ rpc_url = "http://127.0.0.1:18443"
 rpc_user = "u"
 rpc_password = "p"
 poll_interval_ms = 500
-network = "regtest"
 "#
         )
         .unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.rpc_url, "http://127.0.0.1:18443");
-        assert!(cfg.template_rules.is_empty(), "default should be empty");
         assert!(!cfg.zmq_enabled);
+        assert_eq!(AZCOIN_EXPECTED_CHAIN, "main", "hardcoded production chain");
+        assert_eq!(azcoin_template_rules_vec(), vec!["segwit".to_string()]);
         assert_eq!(
             cfg.zmq_endpoint.as_str(),
             "tcp://127.0.0.1:28332",
@@ -166,8 +172,8 @@ network = "regtest"
     }
 
     #[test]
-    fn load_config_with_template_rules() {
-        let dir = std::env::temp_dir().join("azcoin_cfg_test_rules");
+    fn legacy_network_and_template_rules_keys_in_toml_are_ignored() {
+        let dir = std::env::temp_dir().join("azcoin_cfg_test_legacy");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.toml");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -179,12 +185,14 @@ rpc_user = "u"
 rpc_password = "p"
 poll_interval_ms = 500
 network = "regtest"
-template_rules = ["segwit"]
+template_rules = ["nosegwit"]
 "#
         )
         .unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.template_rules, vec!["segwit"]);
+        assert_eq!(cfg.rpc_url, "http://127.0.0.1:18443");
+        assert_eq!(AZCOIN_EXPECTED_CHAIN, "main");
+        assert_eq!(azcoin_template_rules_vec(), vec!["segwit".to_string()]);
     }
 
     #[test]
@@ -200,32 +208,10 @@ rpc_url = ""
 rpc_user = "u"
 rpc_password = "p"
 poll_interval_ms = 500
-network = "regtest"
 "#
         )
         .unwrap();
         assert!(Config::load(&path).is_err());
-    }
-
-    #[test]
-    fn accept_custom_network_name() {
-        let dir = std::env::temp_dir().join("azcoin_cfg_test_custom_net");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test.toml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(
-            f,
-            r#"
-rpc_url = "http://127.0.0.1:18443"
-rpc_user = "u"
-rpc_password = "p"
-poll_interval_ms = 500
-network = "azcoin-main"
-"#
-        )
-        .unwrap();
-        let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.network, "azcoin-main");
     }
 
     #[test]
@@ -241,7 +227,6 @@ rpc_url = "http://127.0.0.1:18443"
 rpc_user = "u"
 rpc_password = "p"
 poll_interval_ms = 500
-network = "regtest"
 zmq_enabled = true
 zmq_endpoint = ""
 "#
@@ -263,7 +248,6 @@ rpc_url = "http://127.0.0.1:18443"
 rpc_user = "u"
 rpc_password = "p"
 poll_interval_ms = 500
-network = "regtest"
 zmq_enabled = true
 zmq_endpoint = "tcp://127.0.0.1:28332"
 zmq_subscribe_hashblock = false

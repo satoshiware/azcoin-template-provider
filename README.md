@@ -149,7 +149,7 @@ Prefer `install`/`cp` with explicit modes; restart only after validating config.
 
 There is **no HTTP health server** by design.
 
-- **`--health-check`** — Loads the TOML config (via `--config` if set), verifies JSON-RPC connectivity, chain name (`network`), and exits **0** on success without starting polling, the SV2 listener, or optional ZMQ subscriber wiring. Intended for scripted probes (e.g. `ExecStartPost` wrappers, Consul, Prometheus blackbox exporter via script).
+- **`--health-check`** — Loads the TOML config (via `--config` if set), verifies JSON-RPC connectivity and that `getblockchaininfo.chain` is **`main`** (built into the binary), and exits **0** on success without starting polling, the SV2 listener, or optional ZMQ subscriber wiring. Intended for scripted probes (e.g. `ExecStartPost` wrappers, Consul, Prometheus blackbox exporter via script).
 
 ```bash
 ./target/release/azcoin-template-provider --health-check \
@@ -179,7 +179,7 @@ Logs use `tracing` with wall-clock **timestamps on each line** (`tracing_subscri
 | `event` | Meaning |
 |---------|---------|
 | `template_provider_startup` | Main services about to run (channels ready, SV2 mode flag set). |
-| `rpc_connectivity_ready` | Startup JSON-RPC handshake and `network` verification succeeded (`health`). |
+| `rpc_connectivity_ready` | Startup JSON-RPC handshake and chain (`main`) verification succeeded (`health`); logs `expected_network` and `template_rules` as binary-built values. |
 | `health_check_complete` | `--health-check` ran successfully before exit. |
 | `pool_connected` | SV2 SetupConnection negotiated; Template Distribution channel ready (`peer`). |
 | `pool_disconnected` | Session ended (TCP hangup, EOF, decode failure, handler error — see `reason` / `detail`). |
@@ -221,7 +221,7 @@ azcoin-template-provider/
 │   ├── rpc.rs        # JSON-RPC client (incl. submitblock)
 │   ├── template.rs   # RPC types, AzcoinTemplate, change detection
 │   ├── poller.rs     # getblocktemplate loop → watch + broadcast
-│   ├── health.rs     # startup connectivity & network match
+│   ├── health.rs     # startup connectivity & mainnet chain check
 │   └── tp_server.rs  # Noise, SV2 TD, live push, SubmitSolution
 ├── testdata/getblocktemplate_regtest.json
 └── README.md
@@ -281,14 +281,14 @@ Framing note: outbound Template Distribution uses **`extension_type == 0`** and 
 
 ## Configuration
 
+Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. Optional ZMQ wakeup knobs remain configurable (see the example file).
+
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `rpc_url` | string | yes | — | JSON-RPC endpoint, e.g. `http://127.0.0.1:8332` |
 | `rpc_user` | string | yes | — | RPC username |
 | `rpc_password` | string | yes | — | RPC password |
 | `poll_interval_ms` | integer | yes | — | Poll interval in ms (minimum 100) |
-| `network` | string | yes | — | Expected chain name from `getblockchaininfo` |
-| `template_rules` | string[] | no | `[]` | BIP rules for `getblocktemplate` |
 | `tp_listen_address` | string | no | `0.0.0.0:8442` | TCP for SV2 Noise listener |
 | `authority_public_key` | string | no | `""` | Hex-encoded 32-byte secp256k1 x-only public key for `pool_sv2` `[template_provider_type.Sv2Tp].public_key`; empty disables SV2 |
 | `authority_secret_key` | string | no | `""` | Hex-encoded 32-byte secp256k1 secret key matching `authority_public_key` |
@@ -388,8 +388,8 @@ azc getchaintips | jq --arg H '<blockhash>' '.[] | select(.hash == $H)'
 
 | Area | Behavior |
 |------|----------|
-| **SegWit** | `getblocktemplate` defaults to `{}`; use `template_rules` for `segwit` when the chain supports it. |
-| **Chain name** | `network` in config must match `getblockchaininfo.chain`. |
+| **SegWit** | Every production `getblocktemplate` call uses `rules: ["segwit"]` (hardcoded). |
+| **Chain name** | Startup validates `getblockchaininfo.chain == "main"` (hardcoded expected chain). |
 | **RPC schema** | Optional fields use `#[serde(default)]` (e.g. `default_witness_commitment`, `weightlimit`). |
 | **`submitblock`** | `None` = accepted, `Some(reason)` = rejected (Bitcoin Core convention). |
 
@@ -413,7 +413,7 @@ If `azcoind` adds fields, extend `Rpc*` types in `src/template.rs` and extend fi
 |---------|----------------|-----|
 | HTTP / RPC errors | Node down or wrong `rpc_url` | Start `azcoind`, verify URL/port |
 | HTTP 401 | Bad credentials | Match `rpc_user` / `rpc_password` |
-| Network mismatch | Wrong `network` | Set to `getblockchaininfo.chain` |
+| Chain mismatch | Node is not on **main** (e.g. testnet/regtest) | Run this Template Provider only against AZCOIN **main**; error: `AZCoin Core chain mismatch: expected main, got …` |
 | Authority key errors | Invalid hex keys | Fix Noise keypair in config |
 | SV2 disabled | Empty authority keys | Set keys or use poller-only mode |
 | `getblocktemplate` [-9] | IBD | Wait for sync |

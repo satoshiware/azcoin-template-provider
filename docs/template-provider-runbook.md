@@ -59,7 +59,7 @@ Run in order; all should look sane before declaring “healthy.”
 1. **Units up** — `azcoin-template-provider`, `azcoind`, and `pool-sv2` show `active (running)` where expected.
 2. **No restart storm** — `systemctl status` shows low restart count / recent uptime unless you intentionally restarted.
 3. **Structured events** — last few minutes include `event=template_provider_startup`, `event=rpc_connectivity_ready`, and (if SV2 enabled) `event=pool_connected` / `event=template_sent`.
-4. **Core RPC** — node responds (`getblockchaininfo` matches configured `network` in TOML; not stuck in unexpected error loops in templar logs).
+4. **Core RPC** — node responds (`getblockchaininfo.chain` is **`main`** per binary validation; not stuck in unexpected error loops in templar logs).
 5. **No critical error bursts** — `journalctl -p err` for the templar unit is quiet aside from known maintenance windows.
 
 Copy/paste starters:
@@ -84,7 +84,7 @@ sudo -u azcoin-templar /opt/azcoin-super/templar/bin/azcoin-template-provider \
   --config /etc/azcoin-super/templar/azcoin-template-provider.toml
 ```
 
-- Exit **0** means config loaded and JSON-RPC/`network` checks passed.
+- Exit **0** means config loaded and JSON-RPC + **main** chain checks passed.
 - Use in scripts or after config edits **before** relying on steady-state mining.
 
 Adjust `sudo -u` if your site runs the check differently; the important part is invoking the **installed** binary with the **installed** config.
@@ -194,7 +194,7 @@ sudo journalctl -u azcoin-template-provider.service --since "15 minutes ago" --n
 Signs of problems:
 
 - Repeating `event=azcoin_rpc_error` with `method=getblocktemplate` or connectivity messages.
-- `network mismatch` messages at startup (config `network` vs node `chain`).
+- `AZCoin Core chain mismatch` messages at startup (node `chain` is not **main**).
 
 Restart order when debugging: **`azcoind` stable first**, then **templar**, then reassess pool.
 
@@ -269,7 +269,7 @@ sudo journalctl -u azcoin-template-provider.service --since "1 hour ago" --no-pa
 | Symptom | First commands |
 |---------|----------------|
 | Unit fails on boot | `sudo systemctl status azcoin-template-provider.service -l --no-pager` · `journalctl -u azcoin-template-provider.service -b --no-pager` |
-| “Network mismatch” | Compare TOML `network` vs `getblockchaininfo.chain` (via your RPC tooling) |
+| “AZCoin Core chain mismatch” | Confirm `getblockchaininfo.chain` is **main** on the node this provider targets |
 | RPC / HTTP errors (`event=azcoin_rpc_error`) | Confirm `rpc_url`, credentials match **azcoind** (without logging secrets); confirm `azcoind` listens on expected bind |
 | No `pool_connected` | Check `pool-sv2.service` · templar listens on `tp_listen_address` · firewall · Noise keys |
 | Stale templates / Lagged warnings | See main README troubleshooting; increase resilience via poll tuning / infra load review |
