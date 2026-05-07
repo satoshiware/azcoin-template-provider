@@ -4,6 +4,7 @@ mod poller;
 mod rpc;
 mod template;
 mod tp_server;
+mod zmq_wakeup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,8 +94,29 @@ async fn main() -> Result<()> {
         poll_interval_ms = cfg.poll_interval_ms,
         tp_listen_address = %cfg.tp_listen_address,
         sv2_tp_enabled = keys_configured,
+        zmq_enabled = cfg.zmq_enabled,
         "template provider wiring complete — starting main tasks"
     );
+
+    let zmq_wakeup_rx = if cfg.zmq_enabled {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let recv_timeout = cfg
+            .zmq_receive_timeout_ms
+            .try_into()
+            .unwrap_or(i32::MAX)
+            .clamp(1, i32::MAX);
+        let zmq_thread_cfg = zmq_wakeup::ZmqThreadConfig {
+            endpoint: cfg.zmq_endpoint.clone(),
+            subscribe_hashblock: cfg.zmq_subscribe_hashblock,
+            subscribe_sequence: cfg.zmq_subscribe_sequence,
+            receive_timeout_ms: recv_timeout,
+            reconnect_backoff_ms: cfg.zmq_reconnect_backoff_ms,
+        };
+        let _zmq_join = zmq_wakeup::spawn_zmq_thread(zmq_thread_cfg, tx);
+        Some(rx)
+    } else {
+        None
+    };
 
     if keys_configured {
         debug!(
@@ -104,7 +126,14 @@ async fn main() -> Result<()> {
         let push = template_push_tx.clone();
         let rpc_tp = client.clone();
         tokio::select! {
-            res = poller::run(client.as_ref(), cfg.poll_interval_ms, template_tx, push) => res,
+            res = poller::run(
+                client.as_ref(),
+                cfg.poll_interval_ms,
+                zmq_wakeup_rx,
+                cfg.zmq_wakeup_debounce_ms,
+                template_tx,
+                push,
+            ) => res,
             res = tp_server::run(
                 &cfg.tp_listen_address,
                 &cfg.authority_public_key,
@@ -119,6 +148,8 @@ async fn main() -> Result<()> {
         poller::run(
             client.as_ref(),
             cfg.poll_interval_ms,
+            zmq_wakeup_rx,
+            cfg.zmq_wakeup_debounce_ms,
             template_tx,
             template_push_tx,
         )
