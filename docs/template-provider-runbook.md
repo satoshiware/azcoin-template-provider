@@ -295,6 +295,54 @@ sudo journalctl -u pool-sv2.service -n 200 --no-pager
 
 ---
 
+## 15. Block submission audit
+
+Template Provider is the owned integration point between AZCoin Core and the SV2 pool path. Treat **`sv2-apps` / `pool_sv2`** as **external software** — do **not** patch it for audit visibility unless AZCOIN deliberately forks or vendors it. This service already logs the **authoritative block-submission lifecycle** with structured `event=` fields.
+
+Relevant lifecycle events:
+
+- `event="solution_received"`
+- `event="submitblock_called"`
+- `event="submitblock_result"`
+
+An **accepted block** record in the journal corresponds to **`event="submitblock_result"`** lines that also include **`outcome="accepted"`**, **`accepted=true`**, **`template_id`**, and **`block_hash`**.
+
+Copy/paste (adjust `--since`/line counts if needed):
+
+**1. Full solution / submission lifecycle**
+
+```bash
+sudo journalctl -u azcoin-template-provider.service -n 1000 --no-pager -l \
+  | grep -E 'event="solution_received"|event="submitblock_called"|event="submitblock_result"'
+```
+
+**2. Accepted blocks only**
+
+```bash
+sudo journalctl -u azcoin-template-provider.service -n 2000 --no-pager -l \
+  | grep 'event="submitblock_result"' \
+  | grep 'accepted=true'
+```
+
+**3. Optional: recent accepted block hashes (`template_id` + `block_hash`)**
+
+```bash
+sudo journalctl -u azcoin-template-provider.service -n 2000 --no-pager -l \
+  | grep 'event="submitblock_result"' \
+  | grep 'accepted=true' \
+  | sed -n 's/.*template_id=\([0-9]*\).*block_hash=Some("\([^"]*\)").*/template_id=\1 block_hash=\2/p'
+```
+
+**How to interpret these logs**
+
+- The **journal timestamp** is when Template Provider observed each step — treat it as the **observed submission / acceptance time**, not a chain timestamp.
+- **`block_hash`** is the **candidate / submitted block hash** Template Provider logs around **`submitblock`** (before and after the RPC), not third-party pool accounting.
+- **`accepted=true`** means AZCoin Core’s **`submitblock`** returned **`null`**, which in Bitcoin-style RPC semantics means the node **accepted** the block.
+- This trail is **operational auditing** (“what did we submit, what did the node say?”). It is **not** miner **payout** or ledger **truth** — that lives in your pool/payout stack.
+- **Do not use `coinbase_output_count`** in logs as payout truth — it reflects SV2/template construction metadata, not payout policy (see section 2).
+
+---
+
 ## Related documentation
 
 - Repository **README.md** — scope, structured log field reference (`event=`), developer build/run.
