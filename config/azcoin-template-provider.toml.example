@@ -57,32 +57,13 @@ zmq_reconnect_backoff_ms = 1000
 zmq_wakeup_debounce_ms = 250
 
 # ----------------------------------------------------------------------------
-# Network
+# AZCOIN chain + getblocktemplate rules (built into the binary, not TOML)
 # ----------------------------------------------------------------------------
-
-# Expected chain name, validated against the `chain` field in
-# getblockchaininfo at startup.  The service will refuse to start if
-# azcoind reports a different chain.
 #
-# AZCOIN may use custom chain names; any non-empty string is accepted.
-network = "regtest"
-
-# ----------------------------------------------------------------------------
-# Template request rules
-# ----------------------------------------------------------------------------
-
-# BIP feature rules to include in the getblocktemplate request object.
+# Production validates getblockchaininfo.chain == "main" and always calls
+# getblocktemplate with rules ["segwit"]. Do not add network= or
+# template_rules= here; legacy keys in old files are ignored by serde.
 #
-# Leave EMPTY (the default) for maximum AZCOIN compatibility — the node
-# will return a basic template without assuming any soft-fork features.
-#
-# Set to ["segwit"] ONLY if the chain has SegWit activated and you need
-# the witness commitment in templates.
-#
-# Example:
-#   template_rules = ["segwit"]
-template_rules = []
-
 # ----------------------------------------------------------------------------
 # SV2 Template Provider
 # ----------------------------------------------------------------------------

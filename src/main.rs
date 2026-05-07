@@ -27,7 +27,7 @@ struct Cli {
     /// Path to TOML configuration file.
     #[arg(short, long, default_value = "config/azcoin-template-provider.toml")]
     config: PathBuf,
-    /// Exit after validating config and verifying azcoind JSON-RPC (+ network match).
+    /// Exit after validating config and verifying azcoind JSON-RPC (+ mainnet chain match).
     #[arg(long)]
     health_check: bool,
 }
@@ -47,28 +47,26 @@ async fn main() -> Result<()> {
     debug!(path = %cli.config.display(), "Loading configuration");
     let cfg = config::Config::load(&cli.config)?;
     debug!(
-        rpc_url  = %cfg.rpc_url,
-        network  = %cfg.network,
-        poll_ms  = cfg.poll_interval_ms,
-        tp_addr  = %cfg.tp_listen_address,
-        "Configuration deserialized and validated"
+        rpc_url = %cfg.rpc_url,
+        poll_ms = cfg.poll_interval_ms,
+        tp_addr = %cfg.tp_listen_address,
+        expected_network = %config::AZCOIN_EXPECTED_CHAIN,
+        template_rules = ?config::azcoin_template_rules_vec(),
+        "Configuration loaded (expected chain and GBT rules are compiled in, not from TOML)"
     );
 
-    let client = Arc::new(
-        rpc::RpcClient::new(
-            cfg.rpc_url.clone(),
-            cfg.rpc_user.clone(),
-            cfg.rpc_password.clone(),
-        )
-        .with_template_rules(cfg.template_rules.clone()),
-    );
+    let client = Arc::new(rpc::RpcClient::new(
+        cfg.rpc_url.clone(),
+        cfg.rpc_user.clone(),
+        cfg.rpc_password.clone(),
+    ));
 
     health::check_rpc_connectivity(client.as_ref(), &cfg).await?;
 
     if cli.health_check {
         tracing::info!(
             event = "health_check_complete",
-            "RPC and network validated (health_check); exiting"
+            "RPC and AZCoin Core `main` chain validated (health_check); exiting"
         );
         return Ok(());
     }
@@ -90,7 +88,8 @@ async fn main() -> Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         config_path = %cli.config.display(),
         rpc_url = %cfg.rpc_url,
-        network = %cfg.network,
+        expected_network = %config::AZCOIN_EXPECTED_CHAIN,
+        template_rules = ?config::azcoin_template_rules_vec(),
         poll_interval_ms = cfg.poll_interval_ms,
         tp_listen_address = %cfg.tp_listen_address,
         sv2_tp_enabled = keys_configured,

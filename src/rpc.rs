@@ -10,11 +10,9 @@
 //!
 //! # Template request rules
 //!
-//! By default, `getblocktemplate` sends an empty request object `{}`.  This is
-//! intentional — AZCOIN may not support SegWit, and sending
-//! `{"rules":["segwit"]}` to a node that does not know about it will fail.
-//! Use [`RpcClient::with_template_rules`] (or the `template_rules` config
-//! field) to opt in to specific rules when the chain supports them.
+//! Production AZCOIN Template Provider always requests **`["segwit"]`** (see
+//! [`crate::config::AZCOIN_TEMPLATE_RULES`]). [`RpcClient::with_template_rules`]
+//! exists for tests or exceptional tooling overrides only.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,6 +22,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::warn;
 
+use crate::config::azcoin_template_rules_vec;
 use crate::template::{RpcBlockHeader, RpcBlockTemplate, RpcBlockchainInfo};
 
 /// Async JSON-RPC client that talks to a single `azcoind` node.
@@ -64,7 +63,7 @@ impl RpcClient {
             password,
             http: Client::new(),
             next_id: AtomicU64::new(1),
-            template_rules: Vec::new(),
+            template_rules: azcoin_template_rules_vec(),
         }
     }
 
@@ -172,10 +171,8 @@ impl RpcClient {
         self.call("getblockchaininfo", &[]).await
     }
 
-    /// Fetch a block template from the node.  The `rules` array sent in the
-    /// template request is controlled by [`RpcClient::with_template_rules`].  When empty
-    /// (the default), an empty object `{}` is sent — compatible with AZCOIN
-    /// nodes that have no SegWit soft fork.
+    /// Fetch a block template from the node using production rule list
+    /// [`AZCOIN_TEMPLATE_RULES`] unless overridden via [`Self::with_template_rules`].
     pub async fn get_block_template(&self) -> Result<RpcBlockTemplate> {
         let request = if self.template_rules.is_empty() {
             json!({})
@@ -183,6 +180,12 @@ impl RpcClient {
             json!({ "rules": self.template_rules })
         };
         self.call("getblocktemplate", &[request]).await
+    }
+
+    /// Rules that will be sent on the next `getblocktemplate` (production default is `segwit`).
+    #[cfg(test)]
+    pub(crate) fn template_rules_for_test(&self) -> &[String] {
+        &self.template_rules
     }
 
     /// Submit a fully-serialised block.  Returns `None` on acceptance or
@@ -208,6 +211,18 @@ impl RpcClient {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+
+    use super::RpcClient;
+
+    #[test]
+    fn new_applies_hardcoded_segwit_template_rules() {
+        let c = RpcClient::new(
+            "http://127.0.0.1:1".to_string(),
+            "u".to_string(),
+            "p".to_string(),
+        );
+        assert_eq!(c.template_rules_for_test(), &["segwit".to_string()]);
+    }
 
     #[test]
     fn submitblock_null_result_means_accepted() {
