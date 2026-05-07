@@ -297,7 +297,7 @@ sudo journalctl -u pool-sv2.service -n 200 --no-pager
 
 ## 15. Block submission audit
 
-Template Provider is the owned integration point between AZCoin Core and the SV2 pool path. Treat **`sv2-apps` / `pool_sv2`** as **external software** — do **not** patch it for audit visibility unless AZCOIN deliberately forks or vendors it. This service already logs the **authoritative block-submission lifecycle** with structured `event=` fields.
+Template Provider is the owned integration point between AZCoin Core and the SV2 pool path. Treat **`sv2-apps` / `pool_sv2`** as **external software** — it may run on a **different host** from Template Provider — and do **not** patch it for audit visibility unless AZCOIN deliberately forks or vendors it. This service already logs the **authoritative block-submission lifecycle** (`event=` fields) whether a **local or remote** pool client submits a solution over the SV2 connection.
 
 Relevant lifecycle events:
 
@@ -306,6 +306,12 @@ Relevant lifecycle events:
 - `event="submitblock_result"`
 
 An **accepted block** record in the journal corresponds to **`event="submitblock_result"`** lines that also include **`outcome="accepted"`**, **`accepted=true`**, **`template_id`**, and **`block_hash`**.
+
+**Where to run (deployment scope)**
+
+- Run the **`journalctl`** snippets below and **`scripts/block_submission_audit.sh`** on the host that runs **`azcoin-template-provider.service`** — i.e. the **Template Provider / AZCoin Core** side — **not** where **`pool_sv2`** happens to run.
+- This audit uses **only** **`azcoin-template-provider.service`** journals. It **must not** assume or require any of the following **on that host**: **`pool-sv2.service`** (or any local pool unit), **local pool `journalctl`** / pool journal files, a checkout of **`sv2-apps`**, **pool config files**, or **paths to a local pool binary**.
+- When present on a line, **`peer=`** is the **SV2 client endpoint as seen by Template Provider** (often **loopback today** if **`pool_sv2`** is colocated; **may later be a remote pool IP/socket** when deployments split roles across hosts). Use it to correlate which peer produced a given lifecycle line — not for payout/accounting truth.
 
 Copy/paste (adjust `--since`/line counts if needed):
 
@@ -333,10 +339,25 @@ sudo journalctl -u azcoin-template-provider.service -n 2000 --no-pager -l \
   | sed -n 's/.*template_id=\([0-9]*\).*block_hash=Some("\([^"]*\)").*/template_id=\1 block_hash=\2/p'
 ```
 
+**Helper script (`scripts/block_submission_audit.sh`)**
+
+Same filters as examples 2–3, with a stable text or JSON Lines printout (no `jq` / Python — `awk` only). **Execute on the Template Provider / AZCoin Core host** (adjust path as needed). It invokes **`sudo journalctl -u azcoin-template-provider.service`** only — identical non-dependencies as above (**no** **`pool-sv2.service`**, pool journald, **`sv2-apps`**, pool configs, or pool binaries on this machine).
+
+```bash
+scripts/block_submission_audit.sh
+
+scripts/block_submission_audit.sh --lines 5000
+
+scripts/block_submission_audit.sh --since "2026-05-07 00:00:00"
+
+scripts/block_submission_audit.sh --since "today" --jsonl
+```
+
 **How to interpret these logs**
 
 - The **journal timestamp** is when Template Provider observed each step — treat it as the **observed submission / acceptance time**, not a chain timestamp.
 - **`block_hash`** is the **candidate / submitted block hash** Template Provider logs around **`submitblock`** (before and after the RPC), not third-party pool accounting.
+- When **`peer=`** appears on a log line, it is **Template Provider’s view of the pool client endpoint** for that lifecycle event (often **localhost / loopback** today when the pool is colocated; may later be a **remote pool IP or socket** when roles are split across hosts). Use it to correlate which peer produced the line **without** local pool journald here — **`peer=`** is still **not** miner payout or ledger truth (`peer=` ≠ miner identity ledger).
 - **`accepted=true`** means AZCoin Core’s **`submitblock`** returned **`null`**, which in Bitcoin-style RPC semantics means the node **accepted** the block.
 - This trail is **operational auditing** (“what did we submit, what did the node say?”). It is **not** miner **payout** or ledger **truth** — that lives in your pool/payout stack.
 - **Do not use `coinbase_output_count`** in logs as payout truth — it reflects SV2/template construction metadata, not payout policy (see section 2).
