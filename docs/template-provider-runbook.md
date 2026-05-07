@@ -8,7 +8,7 @@ Linux-oriented procedures for the **super-node** Template Provider deployment. T
 
 The AZCoin Template Provider is the super-node service that:
 
-- Pulls mining block templates from AZCoin Core (`getblocktemplate` over JSON-RPC).
+- Pulls mining block templates from AZCoin Core (`getblocktemplate` over JSON-RPC; optional **`zmq_enabled`** path may schedule extra **`getblocktemplate`** wakeups from Publisher topics **`hashblock` / `sequence`**, with **`poll_interval_ms` as perpetual backup**).
 - Serves templates to the local (or remote) SV2 pool over **Stratum V2 Template Distribution** (Noise + `NewTemplate` / `SetNewPrevHash`).
 - Accepts `SubmitSolution` from the pool, assembles a full block, and submits it via **`submitblock`** on the node.
 
@@ -76,7 +76,7 @@ sudo journalctl -u azcoin-template-provider.service --since "10 minutes ago" --n
 
 ## 5. Runtime health-check command
 
-The binary supports a **one-shot** RPC and config validation (**no listener**, **no poller**) suitable for probes:
+The binary supports a **one-shot** RPC and config validation (**no steady-state SV2 listener, polling loop, or optional ZMQ subscriber**) suitable for probes:
 
 ```bash
 sudo -u azcoin-templar /opt/azcoin-super/templar/bin/azcoin-template-provider \
@@ -292,6 +292,43 @@ sudo journalctl -u pool-sv2.service -n 200 --no-pager
 - The Template Provider is **not** a wallet host — treat RPC access like production infrastructure: firewall, localhost-only where possible, or TLS + network ACLs per site standards.
 - Redact journals and support bundles before exporting externally.
 - The service user **`azcoin-templar`** should have least privilege — only what is needed for the binary, config readability, and any configured state under `/var/lib/azcoin-super/templar`.
+- ZMQ Publisher sockets (`hashblock` / `sequence`) are typically **unauthenticated** — bind AZCoin Core publishers to **loopback** or operator-trusted internal interfaces; Template Provider only **Subscribes**.
+
+---
+
+## Optional ZMQ template wakeup (additive)
+
+Operators who enable **`zmq_enabled`** connect a Subscriber to AZCoin Core’s Publisher topics **`hashblock`** and **`sequence`**. Incoming multipart frames bump a debounced wakeup that issues another **`getblocktemplate`** RPC pass between poll ticks:
+
+- **Authoritative miner template snapshot:** **`getblocktemplate`** RPC (same as polling-only installs).
+- **Backup watchdog:** **`poll_interval_ms`** still runs indefinitely even if Publisher sockets flap.
+- **`submitblock`:** unchanged JSON-RPC.
+- **`--health-check`:** skips ZMQ entirely (RPC validation only).
+
+**AZCoin Core** (adapt addresses; firewalls must allow Subscriber → Publisher path only):
+
+```text
+zmqpubhashblock=tcp://127.0.0.1:29334
+zmqpubsequence=tcp://127.0.0.1:29334
+```
+
+**Template Provider TOML** (sample values live under **`poll_interval_ms`** in `config/azcoin-template-provider.toml.example`): set **`zmq_enabled = true`**, **`zmq_endpoint`** to the Subscriber **connect** URL (example uses **`tcp://127.0.0.1:29334`**), **`zmq_subscribe_hashblock`**, **`zmq_subscribe_sequence`**, timeouts/debounce knobs as needed.
+
+Builders typically compile vendored **`zeromq`** via crates — confirm any alternate linking policy inside your distro recipe.
+
+Safety: Publishers are often **plain TCP without auth** → bind **`127.0.0.1`** or trusted private overlays.
+
+**Operational smoke:**
+
+```bash
+azcoin-cli getzmqnotifications
+
+sudo journalctl -u azcoin-template-provider.service -n 320 --no-pager -l \
+  | grep -E 'event="zmq_(subscriber_starting|subscriber_ready)"|event="template_refresh_trigger"' \
+  || true
+```
+
+Tune **`poll_interval_ms` slower when ZMQ is healthy** — ZMQ absorbs bursty mempool/tip chatter; **`event=template_refresh_trigger`** emits at **`DEBUG`** verbosity with `reason` ∈ {`poll`, `zmq_hashblock`, `zmq_sequence`} (raise `RUST_LOG` when diagnosing).
 
 ---
 

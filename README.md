@@ -11,6 +11,7 @@
 ## Goal
 
 - Poll `azcoind` for fresh block templates (`getblocktemplate`).
+- Optionally subscribe to AZCoin Core ZMQ (`hashblock`, `sequence`) topics for wakeup hints only — authoritative templates still load via **`getblocktemplate`**; **`poll_interval_ms`** remains backup if ZMQ misses events.
 - Convert templates into SV2 Template Distribution messages (`NewTemplate`, `SetNewPrevHash`).
 - Push fresh work to `pool_sv2` on an ongoing basis (live roll-forward).
 - Receive `SubmitSolution` from the pool, assemble full block hex, call `submitblock` on `azcoind`.
@@ -86,6 +87,32 @@ The Template Provider stays **co-resident** with the local SV2 pool for the MVP 
 
 **This README does not configure `/opt`, `/etc`, or systemd.** Copy artifacts from your CI or release build outputs.
 
+`cargo build --release` pulls the **`zmq`** crate; **`zmq-sys`** is configured with vendored **`zeromq-src`**, so builders typically pick up a statically linked-ish libzmq without installing `libzmq` separately (override only if your organisation pins system linking).
+
+### Optional AZCoin Core ZMQ (`hashblock` / `sequence`)
+
+Enable **`zmq_enabled`** to receive **Bitcoin-style** wakeup topics (**`hashblock`**, **`sequence`**) alongside `poll_interval_ms`. Multipart payloads are **discarded before** every refresh — **`getblocktemplate`** RPC remains authoritative for template snapshots; **`submitblock`** RPC is unchanged.
+
+**Publisher flags on AZCoin Core** (adapt host/port per site):
+
+```text
+zmqpubhashblock=tcp://127.0.0.1:29334
+zmqpubsequence=tcp://127.0.0.1:29334
+```
+
+Set **`zmq_endpoint`** to the Subscriber **connect** target (shown enabled sample in **`config/azcoin-template-provider.toml.example`**). Use **`zmq_enabled = false`** for poll-only refresh identical to pre-ZMQ binaries.
+
+Publishers are usually **unsigned / unauthenticated** — bind **`127.0.0.1`** or constrained internal IPs only.
+
+**Verify:**
+
+```bash
+azcoin-cli getzmqnotifications
+
+sudo journalctl -u azcoin-template-provider.service -n 240 --no-pager \
+  | grep -E 'event="zmq_(subscriber_ready|subscriber_starting)"|event="template_refresh_trigger"' || true
+```
+
 ---
 
 ### Safe manual install / update (run on the deployment host — not from CI)
@@ -122,7 +149,7 @@ Prefer `install`/`cp` with explicit modes; restart only after validating config.
 
 There is **no HTTP health server** by design.
 
-- **`--health-check`** — Loads the TOML config (via `--config` if set), verifies JSON-RPC connectivity, chain name (`network`), and exits **0** on success without starting polling or SV2 listener. Intended for scripted probes (e.g. `ExecStartPost` wrappers, Consul, Prometheus blackbox exporter via script).
+- **`--health-check`** — Loads the TOML config (via `--config` if set), verifies JSON-RPC connectivity, chain name (`network`), and exits **0** on success without starting polling, the SV2 listener, or optional ZMQ subscriber wiring. Intended for scripted probes (e.g. `ExecStartPost` wrappers, Consul, Prometheus blackbox exporter via script).
 
 ```bash
 ./target/release/azcoin-template-provider --health-check \
@@ -158,6 +185,12 @@ Logs use `tracing` with wall-clock **timestamps on each line** (`tracing_subscri
 | `pool_disconnected` | Session ended (TCP hangup, EOF, decode failure, handler error — see `reason` / `detail`). |
 | `template_loaded` | First GBT snapshot received an SV2 `template_id`. |
 | `template_changed` | Template differs from prior (poller semantics; see `change_kind`). |
+| `zmq_disabled` | ZMQ wakeups omitted (poll-interval backup path only). |
+| `zmq_subscriber_starting` / `zmq_subscriber_ready` | Background ZMQ Subscriber thread spun up / socket subscribed. |
+| `zmq_message_received` | First-frame topic classified as UTF-8 vs binary plus aggregate payload length (**no hex dump**). |
+| `template_refresh_trigger` | Schedules RPC refresh (`reason`: `poll`, `zmq_hashblock`, `zmq_sequence` — surfaced at **`debug`** verbosity to avoid chatter). |
+| `zmq_error` | Socket/recv/send failure or wakeup channel dropout. |
+| `zmq_backoff_sleep` | Subscriber sleeping before reconnect. |
 | `template_sent` | `NewTemplate` + `SetNewPrevHash` written to SV2 (`peer`, `template_id`, `previous_block_hash`, placeholder output count, witness flag). |
 | `solution_received` | `SubmitSolution` decoded (`peer`, `template_id`). |
 | `submitblock_called` | About to invoke `submitblock` (`block_hash` if derivation from assembled block succeeded). |

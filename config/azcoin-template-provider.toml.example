@@ -36,6 +36,27 @@ rpc_password = "azcoin"
 poll_interval_ms = 1000
 
 # ----------------------------------------------------------------------------
+# AZCoin Core ZMQ (optional — wakeup / interrupt only)
+# ----------------------------------------------------------------------------
+#
+# When zmq_enabled = true the service subscribes to Bitcoin-style topics
+# (hashblock, sequence) published by AZCoin Core. Multipart payloads are treated
+# as hints only — every refresh still pulls an authoritative snapshot via RPC
+# getblocktemplate (submitblock stays JSON-RPC). poll_interval_ms remains the
+# backup cadence when ZMQ disconnects or is quiet.
+#
+# Security: ZeroMQ Publisher/Subscriber transports are typically unauthenticated;
+# bind to loopback / trusted VLAN / WireGuard, not raw public IPs.
+#
+zmq_enabled = true
+zmq_endpoint = "tcp://127.0.0.1:29334"
+zmq_subscribe_hashblock = true
+zmq_subscribe_sequence = true
+zmq_receive_timeout_ms = 1000
+zmq_reconnect_backoff_ms = 1000
+zmq_wakeup_debounce_ms = 250
+
+# ----------------------------------------------------------------------------
 # Network
 # ----------------------------------------------------------------------------
 
