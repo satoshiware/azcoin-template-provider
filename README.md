@@ -4,6 +4,8 @@
 
 **Release 0.2.0** is done: `pool_sv2` compatibility for template identity, `CoinbaseOutputConstraints`, and `RequestTransactionData`, plus split read/write codec, live roll-forward, and block submission. This document matches crate version **0.2.0** (`Cargo.toml`).
 
+**Super-node operators:** step-by-step checks, systemd/journal workflows, installs, rollback, and failure triage → [docs/template-provider-runbook.md](docs/template-provider-runbook.md).
+
 ---
 
 ## Goal
