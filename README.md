@@ -10,8 +10,8 @@
 
 ## Goal
 
-- Poll `azcoind` for fresh block templates (`getblocktemplate`).
-- Optionally subscribe to AZCoin Core ZMQ (`hashblock`, `sequence`) topics for wakeup hints only — authoritative templates still load via **`getblocktemplate`**; **`poll_interval_ms`** remains backup if ZMQ misses events.
+- Poll `azcoind` for fresh block templates (`getblocktemplate`) on a fixed cadence (`poll_interval_ms`) as a perpetual safety fallback.
+- Connect to AZCoin Core ZMQ Publishers on **`rawtx`**, **`hashblock`**, and **`sequence`** (separate Subscriber connect URLs) for low-latency wakeup hints only — authoritative templates **always** come from **`getblocktemplate`** after every wakeup or poll tick; **`submitblock`** stays JSON-RPC unchanged.
 - Convert templates into SV2 Template Distribution messages (`NewTemplate`, `SetNewPrevHash`).
 - Push fresh work to `pool_sv2` on an ongoing basis (live roll-forward).
 - Receive `SubmitSolution` from the pool, assemble full block hex, call `submitblock` on `azcoind`.
@@ -23,9 +23,9 @@
 
 ### Included
 
-- `getblocktemplate` polling from the AZCoin node RPC.
+- **`getblocktemplate` polling plus ZMQ (`rawtx` / `hashblock` / `sequence`) wakeup hints** toward the AZCoin node.
 - Initial SV2 template distribution after `SetupConnection` + `CoinbaseOutputConstraints`.
-- Live SV2 template roll-forward when the poller detects meaningful template changes.
+- Live SV2 template roll-forward when the poller detects **chain-tip changes** (`previousblockhash` / height vs last broadcast), or mempool growth that clears **`fee_threshold`** without exceeding **`max_template_transactions`** (fee-threshold path applies only while the chain tip matches the last pushed template — see **`config/azcoin-template-provider.toml.example`** comments).
 - `SubmitSolution` (message type **118** / `0x76`) decode and handling.
 - Full block assembly from solved template + coinbase, then `submitblock`.
 - Monotonic `template_id` allocation with exact snapshot caching by allocated ID.
@@ -51,7 +51,8 @@
 
 ```text
 azcoind
-  └─ RPC: getblocktemplate / submitblock
+  └─ JSON-RPC (required): getblockchaininfo, getblocktemplate, submitblock
+  └─ ZMQ Publisher (recommended): rawtx / hashblock / sequence → wakeup hints only
        │
        ▼
 azcoin-template-provider
@@ -89,18 +90,19 @@ The Template Provider stays **co-resident** with the local SV2 pool for the MVP 
 
 `cargo build --release` pulls the **`zmq`** crate; **`zmq-sys`** is configured with vendored **`zeromq-src`**, so builders typically pick up a statically linked-ish libzmq without installing `libzmq` separately (override only if your organisation pins system linking).
 
-### Optional AZCoin Core ZMQ (`hashblock` / `sequence`)
+### AZCoin Core ZMQ (`rawtx` / `hashblock` / `sequence`)
 
-Enable **`zmq_enabled`** to receive **Bitcoin-style** wakeup topics (**`hashblock`**, **`sequence`**) alongside `poll_interval_ms`. Multipart payloads are **discarded before** every refresh — **`getblocktemplate`** RPC remains authoritative for template snapshots; **`submitblock`** RPC is unchanged.
+Templar **always** runs a background SUB socket that **connects to all three** configured endpoints and subscribes to **`rawtx`**, **`hashblock`**, and **`sequence`**. Multipart bodies are **not** parsed for mining templates — every signal only schedules another **`getblocktemplate`** RPC pass (debounced). **`poll_interval_ms`** remains the perpetual backup if ZMQ disconnects, errors, or is quiet; reconnect uses `zmq_reconnect_backoff_ms` with structured **`event=zmq_error`** lines that include **`polling_fallback_active=true`**.
 
-**Publisher flags on AZCoin Core** (adapt host/port per site):
+**Publisher flags on AZCoin Core** (example — align ports with your `zmq_endpoint_*` values):
 
 ```text
+zmqpubrawtx=tcp://127.0.0.1:29333
 zmqpubhashblock=tcp://127.0.0.1:29334
-zmqpubsequence=tcp://127.0.0.1:29334
+zmqpubsequence=tcp://127.0.0.1:29335
 ```
 
-Set **`zmq_endpoint`** to the Subscriber **connect** target (shown enabled sample in **`config/azcoin-template-provider.toml.example`**). Use **`zmq_enabled = false`** for poll-only refresh identical to pre-ZMQ binaries.
+Legacy config keys such as **`zmq_enabled`** or a single **`zmq_endpoint`** are **ignored** (not part of the current schema); ZMQ wakeup cannot be disabled via TOML.
 
 Publishers are usually **unsigned / unauthenticated** — bind **`127.0.0.1`** or constrained internal IPs only.
 
@@ -149,7 +151,7 @@ Prefer `install`/`cp` with explicit modes; restart only after validating config.
 
 There is **no HTTP health server** by design.
 
-- **`--health-check`** — Loads the TOML config (via `--config` if set), verifies JSON-RPC connectivity and that `getblockchaininfo.chain` is **`main`** (built into the binary), and exits **0** on success without starting polling, the SV2 listener, or optional ZMQ subscriber wiring. Intended for scripted probes (e.g. `ExecStartPost` wrappers, Consul, Prometheus blackbox exporter via script).
+- **`--health-check`** — Loads the TOML config (via `--config` if set), verifies JSON-RPC connectivity and that `getblockchaininfo.chain` is **`main`** (built into the binary), and exits **0** on success without starting polling, the SV2 listener, or ZMQ subscriber wiring. Intended for scripted probes (e.g. `ExecStartPost` wrappers, Consul, Prometheus blackbox exporter via script).
 
 ```bash
 ./target/release/azcoin-template-provider --health-check \
@@ -174,7 +176,7 @@ RUST_LOG=azcoin_template_provider=trace,info ./target/release/azcoin-template-pr
 
 `warn!` / `error!` calls are unchanged and stay visible under the default filter.
 
-Logs use `tracing` with wall-clock **timestamps on each line** (`tracing_subscriber::fmt::time::SystemTime`). Filter or ship logs by the stable **`event`** field where present:
+Logs use `tracing` with wall-clock **timestamps on each line** (`tracing_subscriber::fmt::time::SystemTime`). When **`log_file`** is set in TOML, the same structured stream is **appended** to that path **in addition to** stdout; the parent directory must already exist and be writable (the service does not create parent directories). Filter or ship logs by the stable **`event`** field where present:
 
 | `event` | Meaning |
 |---------|---------|
@@ -185,11 +187,12 @@ Logs use `tracing` with wall-clock **timestamps on each line** (`tracing_subscri
 | `pool_disconnected` | Session ended (TCP hangup, EOF, decode failure, handler error — see `reason` / `detail`). |
 | `template_loaded` | First GBT snapshot received an SV2 `template_id`. |
 | `template_changed` | Template differs from prior (poller semantics; see `change_kind`). |
-| `zmq_disabled` | ZMQ wakeups omitted (poll-interval backup path only). |
-| `zmq_subscriber_starting` / `zmq_subscriber_ready` | Background ZMQ Subscriber thread spun up / socket subscribed. |
+| `zmq_subscriber_starting` / `zmq_subscriber_ready` | Background ZMQ Subscriber thread spun up / all three topics subscribed. |
 | `zmq_message_received` | First-frame topic classified as UTF-8 vs binary plus aggregate payload length (**no hex dump**). |
-| `template_refresh_trigger` | Schedules RPC refresh (`reason`: `poll`, `zmq_hashblock`, `zmq_sequence` — surfaced at **`debug`** verbosity to avoid chatter). |
-| `zmq_error` | Socket/recv/send failure or wakeup channel dropout. |
+| `template_refresh_trigger` | Schedules RPC refresh (`reason`: `poll`, `zmq_rawtx`, `zmq_hashblock`, `zmq_sequence` — surfaced at **`debug`** verbosity). |
+| `zmq_error` | Socket/recv/send failure, wakeup channel dropout, or subscribe-loop exit (look for **`polling_fallback_active=true`** — polls continue). |
+| `template_update_suppressed` | Mempool-only GBT refresh skipped for SV2 broadcast (`reason=fee_delta_below_threshold`, **`debug`**). |
+| `template_rejected` | Mempool-only candidate failed `max_template_transactions` after fee threshold (`reason=max_template_transactions_exceeded`, **`warn`**). |
 | `zmq_backoff_sleep` | Subscriber sleeping before reconnect. |
 | `template_sent` | `NewTemplate` + `SetNewPrevHash` written to SV2 (`peer`, `template_id`, `previous_block_hash`, placeholder output count, witness flag). |
 | `solution_received` | `SubmitSolution` decoded (`peer`, `template_id`). |
@@ -271,7 +274,7 @@ Healthy signals after the fix: `skipped_intermediate` at or near **0** during no
 
 ## Data flow (implementation)
 
-1. **`poller`** calls `getblocktemplate`, builds [`AzcoinTemplate`](src/template.rs), allocates a monotonic provider-side `template_id` for each meaningful update, updates a `watch` channel with the latest [`TemplateSnapshot`](src/template.rs), and sends [`TemplateUpdatePayload`](src/template.rs) on a `broadcast` channel for live SV2 pushes.
+1. **`poller`** calls `getblocktemplate`, builds [`AzcoinTemplate`](src/template.rs), allocates `template_id` for **eligible** broadcasts (chain-tip rollover always wins; mempool-only pushes need fee delta **`≥ fee_threshold`** and **`transactions.len() ≤ max_template_transactions`**), updates a `watch` channel with the latest **accepted** [`TemplateSnapshot`](src/template.rs), and sends [`TemplateUpdatePayload`](src/template.rs) on `broadcast` for live SV2 pushes.
 2. **`tp_server`** completes Noise NX, `SetupConnection` (Template Distribution, protocol version 2), reads `CoinbaseOutputConstraints`, validates the current template against the reserved coinbase headroom, sends initial `NewTemplate` + `SetNewPrevHash`, then runs a read loop plus a writer task subscribed to template broadcasts.
 3. **Inbound `SubmitSolution` / `RequestTransactionData`** — Parsed in `log_and_dispatch_post_init_sv2_frame`; solved blocks are assembled from the exact cached snapshot and submitted with [`RpcClient::submit_block`](src/rpc.rs); transaction-data requests return the cached non-coinbase transactions plus excess data.
 
@@ -281,14 +284,40 @@ Framing note: outbound Template Distribution uses **`extension_type == 0`** and 
 
 ## Configuration
 
-Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. Optional ZMQ wakeup knobs remain configurable (see the example file).
+Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. ZMQ endpoint addresses and push policy knobs are configurable (see **`config/azcoin-template-provider.toml.example`**).
+
+### JSON-RPC whitelist (AZCoin Core `rpcwhitelist` reference)
+
+Operational **minimum** RPC methods templar invokes in normal steady state:
+
+| Method | Role |
+|--------|------|
+| `getblockchaininfo` | Startup chain (`main`) + health checks |
+| `getblocktemplate` | Authoritative block templates (`rules: ["segwit"]`, hardcoded) |
+| `submitblock` | `SubmitSolution` → assembled block submission |
+
+Optional / internal-only helpers (**defined in [`src/rpc.rs`](src/rpc.rs)** but **not wired** into `main` steady-state loops today — diagnostics or future tooling only):
+
+| Method | Role |
+|--------|------|
+| `getbestblockhash` | Tip hash helper (Bitcoin / AZCoin Core name — **not** `getbesthash`) |
+| `getblockheader` | Header diagnostic helper |
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `rpc_url` | string | yes | — | JSON-RPC endpoint, e.g. `http://127.0.0.1:8332` |
 | `rpc_user` | string | yes | — | RPC username |
 | `rpc_password` | string | yes | — | RPC password |
-| `poll_interval_ms` | integer | yes | — | Poll interval in ms (minimum 100) |
+| `poll_interval_ms` | integer | yes | — | Poll interval in ms (minimum 100; perpetual ZMQ-loss fallback) |
+| `zmq_endpoint_rawtx` | string | no | `tcp://127.0.0.1:29333` | SUB connect URL for **`rawtx`** Publisher |
+| `zmq_endpoint_hashblock` | string | no | `tcp://127.0.0.1:29334` | SUB connect URL for **`hashblock`** Publisher |
+| `zmq_endpoint_sequence` | string | no | `tcp://127.0.0.1:29335` | SUB connect URL for **`sequence`** Publisher |
+| `fee_threshold` | integer | no | `5000` | Min satoshi **fee-sum increase** vs last pushed template **at same tip** to SV2-push a mempool-only update |
+| `max_template_transactions` | integer | no | `5000` | Caps non-coinbase tx count on **fee-threshold-qualified** mempool-only pushes (**ignored on chain-tip rollover**) |
+| `log_file` | string | no | `""` | Append structured logs here as well as stdout; empty disables file sink |
+| `zmq_receive_timeout_ms` | integer | no | `1000` | ZMQ `RECVTIMEO` for subscriber thread recv |
+| `zmq_reconnect_backoff_ms` | integer | no | `1000` | Sleep before restarting SUB after transport errors |
+| `zmq_wakeup_debounce_ms` | integer | no | `250` | Debounce coalescing for bursty ZMQ signals |
 | `tp_listen_address` | string | no | `0.0.0.0:8442` | TCP for SV2 Noise listener |
 | `authority_public_key` | string | no | `""` | Hex-encoded 32-byte secp256k1 x-only public key for `pool_sv2` `[template_provider_type.Sv2Tp].public_key`; empty disables SV2 |
 | `authority_secret_key` | string | no | `""` | Hex-encoded 32-byte secp256k1 secret key matching `authority_public_key` |
@@ -399,10 +428,10 @@ If `azcoind` adds fields, extend `Rpc*` types in `src/template.rs` and extend fi
 
 ## What “template changed” means
 
-| Change | Log |
-|--------|-----|
-| `previousblockhash` differs | New block on the network — template builds on a new tip. |
-| Same prev hash, tx set or coinbase value differs | Template updated (mempool changed). |
+| Change | SV2 broadcast |
+|--------|----------------|
+| `previousblockhash` or `height` differs vs **last pushed** template | **Always** (`NewTemplate` / `SetNewPrevHash`) — ignores `fee_threshold` and `max_template_transactions`. |
+| Same chain tip, transaction set / coinbase value differs | **Only if** summed non-coinbase fees increased by **`≥ fee_threshold`** sats vs last push **and** `transactions.len() ≤ max_template_transactions`. |
 | Only `curtime` moves | Debug “unchanged” — ignored to reduce noise. |
 
 ---
