@@ -1,7 +1,8 @@
 //! TOML configuration loading for the azcoin-template-provider service.
 //!
-//! The config file holds RPC connection details, polling interval, optional ZMQ,
-//! and TP listener address. **Chain name and `getblocktemplate` rules are
+//! The config file holds RPC connection details, polling interval, ZMQ wakeup
+//! endpoints, fee / template sizing limits, optional file logging path, and TP
+//! listener address. **Chain name and `getblocktemplate` rules are
 //! compiled into the binary** for AZCOIN production (`main` + `segwit`).
 //! See `config/azcoin-template-provider.toml.example` for a fully-commented
 //! reference.
@@ -28,8 +29,11 @@ pub fn azcoin_template_rules_vec() -> Vec<String> {
 /// Top-level configuration, deserialized from a TOML file.
 ///
 /// Required fields: `rpc_url`, `rpc_user`, `rpc_password`, `poll_interval_ms`.
-/// Legacy keys such as `network` or `template_rules` in existing TOML files are
-/// **ignored** by serde (not part of this struct).
+/// Legacy keys such as `network`, `template_rules`, `zmq_enabled`,
+/// `zmq_endpoint`, `zmq_subscribe_hashblock`, or `zmq_subscribe_sequence`
+/// are **ignored** by serde when absent from this struct — ZMQ wakeup is always
+/// wired via [`Config::zmq_endpoint_rawtx`], [`Config::zmq_endpoint_hashblock`],
+/// and [`Config::zmq_endpoint_sequence`].
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     /// JSON-RPC endpoint of `azcoind`, e.g. `http://127.0.0.1:8332`.
@@ -53,16 +57,27 @@ pub struct Config {
     #[serde(default)]
     #[allow(dead_code)]
     pub authority_secret_key: String,
-    /// When true, connect to AZCoin Core ZMQ Publisher (wakeup/interrupt only; GBT stays authoritative).
-    #[serde(default = "default_zmq_disabled")]
-    pub zmq_enabled: bool,
-    /// ZMQ Subscriber connect URL (`tcp://host:port` must match node's `-zmqpub*` bind).
-    #[serde(default = "default_zmq_endpoint")]
-    pub zmq_endpoint: String,
-    #[serde(default = "default_true_bool")]
-    pub zmq_subscribe_hashblock: bool,
-    #[serde(default = "default_true_bool")]
-    pub zmq_subscribe_sequence: bool,
+    /// Subscriber connect URL for **`rawtx`** (must match node's `-zmqpubrawtx` bind).
+    #[serde(default = "default_zmq_endpoint_rawtx")]
+    pub zmq_endpoint_rawtx: String,
+    /// Subscriber connect URL for **`hashblock`** (must match `-zmqpubhashblock`).
+    #[serde(default = "default_zmq_endpoint_hashblock")]
+    pub zmq_endpoint_hashblock: String,
+    /// Subscriber connect URL for **`sequence`** (must match `-zmqpubsequence`).
+    #[serde(default = "default_zmq_endpoint_sequence")]
+    pub zmq_endpoint_sequence: String,
+    /// Minimum increase in summed non-coinbase transaction fees (sats vs last pushed
+    /// template at the same chain tip) before a mempool-driven template may be broadcast.
+    #[serde(default = "default_fee_threshold")]
+    pub fee_threshold: u64,
+    /// Upper bound on non-coinbase transaction count for a **fee-threshold-enabled**
+    /// mempool-only template push (`hashblock`/tip-change pushes ignore this limit).
+    #[serde(default = "default_max_template_transactions")]
+    pub max_template_transactions: u64,
+    /// When non-empty, append structured logs here in addition to stdout. Parent directory
+    /// must exist and be writable by the service user (the binary does not create parents).
+    #[serde(default)]
+    pub log_file: String,
     /// Per-recv syscall timeout (`zmq::setsockopt RECVTIMEO`); avoids blocking forever inside the subscriber thread.
     #[serde(default = "default_zmq_receive_timeout_ms")]
     pub zmq_receive_timeout_ms: u64,
@@ -78,16 +93,24 @@ fn default_tp_listen_address() -> String {
     "0.0.0.0:8442".to_string()
 }
 
-fn default_zmq_disabled() -> bool {
-    false
+fn default_zmq_endpoint_rawtx() -> String {
+    "tcp://127.0.0.1:29333".to_string()
 }
 
-fn default_zmq_endpoint() -> String {
-    "tcp://127.0.0.1:28332".to_string()
+fn default_zmq_endpoint_hashblock() -> String {
+    "tcp://127.0.0.1:29334".to_string()
 }
 
-fn default_true_bool() -> bool {
-    true
+fn default_zmq_endpoint_sequence() -> String {
+    "tcp://127.0.0.1:29335".to_string()
+}
+
+fn default_fee_threshold() -> u64 {
+    5000
+}
+
+fn default_max_template_transactions() -> u64 {
+    5000
 }
 
 fn default_zmq_receive_timeout_ms() -> u64 {
@@ -120,16 +143,22 @@ impl Config {
             "poll_interval_ms must be >= 100 (got {})",
             self.poll_interval_ms
         );
-        if self.zmq_enabled {
-            anyhow::ensure!(
-                !self.zmq_endpoint.trim().is_empty(),
-                "zmq_enabled requires non-empty zmq_endpoint"
-            );
-            anyhow::ensure!(
-                self.zmq_subscribe_hashblock || self.zmq_subscribe_sequence,
-                "zmq_enabled requires zmq_subscribe_hashblock=true and/or zmq_subscribe_sequence=true"
-            );
-        }
+        anyhow::ensure!(
+            !self.zmq_endpoint_rawtx.trim().is_empty(),
+            "zmq_endpoint_rawtx must not be empty"
+        );
+        anyhow::ensure!(
+            !self.zmq_endpoint_hashblock.trim().is_empty(),
+            "zmq_endpoint_hashblock must not be empty"
+        );
+        anyhow::ensure!(
+            !self.zmq_endpoint_sequence.trim().is_empty(),
+            "zmq_endpoint_sequence must not be empty"
+        );
+        anyhow::ensure!(
+            self.max_template_transactions > 0,
+            "max_template_transactions must be > 0"
+        );
         Ok(())
     }
 }
@@ -157,15 +186,14 @@ poll_interval_ms = 500
         .unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.rpc_url, "http://127.0.0.1:18443");
-        assert!(!cfg.zmq_enabled);
+        assert_eq!(cfg.zmq_endpoint_rawtx, "tcp://127.0.0.1:29333");
+        assert_eq!(cfg.zmq_endpoint_hashblock, "tcp://127.0.0.1:29334");
+        assert_eq!(cfg.zmq_endpoint_sequence, "tcp://127.0.0.1:29335");
+        assert_eq!(cfg.fee_threshold, 5000);
+        assert_eq!(cfg.max_template_transactions, 5000);
+        assert_eq!(cfg.log_file, "");
         assert_eq!(AZCOIN_EXPECTED_CHAIN, "main", "hardcoded production chain");
         assert_eq!(azcoin_template_rules_vec(), vec!["segwit".to_string()]);
-        assert_eq!(
-            cfg.zmq_endpoint.as_str(),
-            "tcp://127.0.0.1:28332",
-            "default demo endpoint before site-specific edits"
-        );
-        assert!(cfg.zmq_subscribe_hashblock && cfg.zmq_subscribe_sequence);
         assert_eq!(cfg.zmq_receive_timeout_ms, 1000);
         assert_eq!(cfg.zmq_reconnect_backoff_ms, 1000);
         assert_eq!(cfg.zmq_wakeup_debounce_ms, 250);
@@ -196,6 +224,34 @@ template_rules = ["nosegwit"]
     }
 
     #[test]
+    fn legacy_zmq_toggle_keys_are_ignored_zmq_always_configured() {
+        let dir = std::env::temp_dir().join("azcoin_cfg_test_legacy_zmq");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"
+rpc_url = "http://127.0.0.1:18443"
+rpc_user = "u"
+rpc_password = "p"
+poll_interval_ms = 500
+zmq_enabled = false
+zmq_endpoint = "tcp://127.0.0.1:9999"
+zmq_subscribe_hashblock = false
+zmq_subscribe_sequence = false
+"#
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.zmq_endpoint_rawtx,
+            default_zmq_endpoint_rawtx(),
+            "deprecated toggles ignored; canonical rawtx endpoint defaults apply"
+        );
+    }
+
+    #[test]
     fn reject_empty_rpc_url() {
         let dir = std::env::temp_dir().join("azcoin_cfg_test_reject");
         let _ = std::fs::create_dir_all(&dir);
@@ -215,7 +271,7 @@ poll_interval_ms = 500
     }
 
     #[test]
-    fn reject_zmq_enabled_empty_endpoint() {
+    fn reject_empty_zmq_endpoint_rawtx() {
         let dir = std::env::temp_dir().join("azcoin_cfg_test_zmq_ep");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.toml");
@@ -227,31 +283,7 @@ rpc_url = "http://127.0.0.1:18443"
 rpc_user = "u"
 rpc_password = "p"
 poll_interval_ms = 500
-zmq_enabled = true
-zmq_endpoint = ""
-"#
-        )
-        .unwrap();
-        assert!(Config::load(&path).is_err());
-    }
-
-    #[test]
-    fn reject_zmq_enabled_no_topics() {
-        let dir = std::env::temp_dir().join("azcoin_cfg_test_zmq_topic");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test.toml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(
-            f,
-            r#"
-rpc_url = "http://127.0.0.1:18443"
-rpc_user = "u"
-rpc_password = "p"
-poll_interval_ms = 500
-zmq_enabled = true
-zmq_endpoint = "tcp://127.0.0.1:28332"
-zmq_subscribe_hashblock = false
-zmq_subscribe_sequence = false
+zmq_endpoint_rawtx = ""
 "#
         )
         .unwrap();

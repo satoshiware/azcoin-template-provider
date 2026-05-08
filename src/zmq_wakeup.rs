@@ -1,4 +1,5 @@
-//! ZMQ Subscriber thread — interrupt/wakeup hints only (`hashblock`, `sequence` topics).
+//! ZMQ Subscriber thread — interrupt/wakeup hints only (`rawtx`, `hashblock`,
+//! `sequence` topics).
 //! Template construction remains authoritative via RPC `getblocktemplate`.
 
 use std::thread;
@@ -10,30 +11,35 @@ use tracing::{debug, error, info, trace, warn};
 /// Which subscribed topic signaled a wakeup (no payload semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ZmqWakeupKind {
+    /// Mempool / transaction ingress hint.
+    Rawtx,
     Hashblock,
+    /// Block-chain or mempool ordering hint (`sequence` publishes both).
     Sequence,
 }
 
 /// Owned parameters for [`spawn_zmq_thread`].
 #[derive(Clone, Debug)]
 pub(crate) struct ZmqThreadConfig {
-    pub endpoint: String,
-    pub subscribe_hashblock: bool,
-    pub subscribe_sequence: bool,
+    pub endpoint_rawtx: String,
+    pub endpoint_hashblock: String,
+    pub endpoint_sequence: String,
     pub receive_timeout_ms: i32,
     pub reconnect_backoff_ms: u64,
 }
 
+/// Merge debounced wakes: **`hashblock` wins over `sequence` and `rawtx`**; otherwise
+/// the latest mempool-class topic replaces the prior one.
 pub(crate) fn merge_zmq_pending(
     prior: Option<ZmqWakeupKind>,
     next: ZmqWakeupKind,
 ) -> ZmqWakeupKind {
-    match prior {
-        None => next,
-        Some(ZmqWakeupKind::Hashblock) => ZmqWakeupKind::Hashblock,
-        Some(ZmqWakeupKind::Sequence) => match next {
-            ZmqWakeupKind::Hashblock => ZmqWakeupKind::Hashblock,
-            ZmqWakeupKind::Sequence => ZmqWakeupKind::Sequence,
+    match next {
+        ZmqWakeupKind::Hashblock => ZmqWakeupKind::Hashblock,
+        _ => match prior {
+            Some(ZmqWakeupKind::Hashblock) => ZmqWakeupKind::Hashblock,
+            None => next,
+            Some(_) => next,
         },
     }
 }
@@ -43,6 +49,16 @@ pub(crate) fn topic_label_for_event(first_part: &[u8]) -> &'static str {
         "utf8_topic"
     } else {
         "non_utf8_topic"
+    }
+}
+
+/// Map the first multipart frame (topic string) to a wakeup kind (`None` when unknown).
+pub(crate) fn classify_zmq_topic(first_part: &[u8]) -> Option<ZmqWakeupKind> {
+    match first_part {
+        b"rawtx" => Some(ZmqWakeupKind::Rawtx),
+        b"hashblock" => Some(ZmqWakeupKind::Hashblock),
+        b"sequence" => Some(ZmqWakeupKind::Sequence),
+        _ => None,
     }
 }
 
@@ -57,24 +73,30 @@ pub(crate) fn spawn_zmq_thread(
 fn zmq_runner(cfg: ZmqThreadConfig, wakeup_tx: UnboundedSender<ZmqWakeupKind>) {
     info!(
         event = "zmq_subscriber_starting",
-        endpoint = %cfg.endpoint,
-        subscribe_hashblock = cfg.subscribe_hashblock,
-        subscribe_sequence = cfg.subscribe_sequence,
+        endpoint_rawtx = %cfg.endpoint_rawtx,
+        endpoint_hashblock = %cfg.endpoint_hashblock,
+        endpoint_sequence = %cfg.endpoint_sequence,
         recv_timeout_ms = cfg.receive_timeout_ms,
         reconnect_backoff_ms = cfg.reconnect_backoff_ms,
-        "ZMQ subscriber thread starting"
+        "ZMQ subscriber thread starting (rawtx/hashblock/sequence; payloads ignored for templates)"
     );
 
     loop {
         if let Err(e) = subscribe_loop(&cfg, &wakeup_tx) {
             warn!(
                 event = "zmq_error",
+                polling_fallback_active = true,
                 error = ?e,
-                "ZMQ subscribe loop exited; backing off before reconnect attempt"
+                endpoint_rawtx = %cfg.endpoint_rawtx,
+                endpoint_hashblock = %cfg.endpoint_hashblock,
+                endpoint_sequence = %cfg.endpoint_sequence,
+                reconnect_backoff_ms = cfg.reconnect_backoff_ms,
+                "ZMQ subscribe loop exited; poll_interval_ms remains active — backing off before reconnect"
             );
             info!(
                 event = "zmq_backoff_sleep",
                 backoff_ms = cfg.reconnect_backoff_ms,
+                polling_fallback_active = true,
                 "attempting reconnect after backoff delay"
             );
             thread::sleep(Duration::from_millis(cfg.reconnect_backoff_ms));
@@ -89,22 +111,20 @@ fn subscribe_loop(
     let ctx = zmq::Context::new();
     let sock = ctx.socket(zmq::SUB)?;
     sock.set_rcvtimeo(cfg.receive_timeout_ms)?;
-    sock.connect(&cfg.endpoint)?;
-
-    if cfg.subscribe_hashblock {
-        sock.set_subscribe(b"hashblock")?;
-    }
-    if cfg.subscribe_sequence {
-        sock.set_subscribe(b"sequence")?;
-    }
+    sock.connect(&cfg.endpoint_rawtx)?;
+    sock.connect(&cfg.endpoint_hashblock)?;
+    sock.connect(&cfg.endpoint_sequence)?;
+    sock.set_subscribe(b"rawtx")?;
+    sock.set_subscribe(b"hashblock")?;
+    sock.set_subscribe(b"sequence")?;
 
     info!(
         event = "zmq_subscriber_ready",
-        endpoint = %cfg.endpoint,
-        subscribe_hashblock = cfg.subscribe_hashblock,
-        subscribe_sequence = cfg.subscribe_sequence,
+        endpoint_rawtx = %cfg.endpoint_rawtx,
+        endpoint_hashblock = %cfg.endpoint_hashblock,
+        endpoint_sequence = %cfg.endpoint_sequence,
         recv_timeout_ms = cfg.receive_timeout_ms,
-        "ZMQ subscriber subscribed (wakeup/interrupt-only; payloads are ignored for template assembly)"
+        "ZMQ subscriber connected and subscribed (wakeup-only; templates from getblocktemplate only)"
     );
 
     loop {
@@ -118,18 +138,20 @@ fn subscribe_loop(
                 );
             }
             Ok(parts) => {
-                handle_multipart(parts, cfg, wakeup_tx)?;
+                handle_multipart(parts, wakeup_tx)?;
             }
             Err(zmq::Error::EAGAIN) => {
-                // Periodic timeout — keep looping (allows responsive shutdown only at process terminate).
                 continue;
             }
             Err(e) => {
                 warn!(
                     event = "zmq_error",
+                    polling_fallback_active = true,
                     error = ?e,
                     recv_timeout_ms = cfg.receive_timeout_ms,
-                    endpoint = %cfg.endpoint,
+                    endpoint_rawtx = %cfg.endpoint_rawtx,
+                    endpoint_hashblock = %cfg.endpoint_hashblock,
+                    endpoint_sequence = %cfg.endpoint_sequence,
                     "recv_multipart failure; restarting subscribe loop after reconnect"
                 );
                 return Err(anyhow::anyhow!(e));
@@ -140,19 +162,8 @@ fn subscribe_loop(
     Ok(())
 }
 
-fn classify_topic(first_part: &[u8], cfg: &ZmqThreadConfig) -> Option<ZmqWakeupKind> {
-    if cfg.subscribe_hashblock && first_part == b"hashblock" {
-        return Some(ZmqWakeupKind::Hashblock);
-    }
-    if cfg.subscribe_sequence && first_part == b"sequence" {
-        return Some(ZmqWakeupKind::Sequence);
-    }
-    None
-}
-
 fn handle_multipart(
     parts: Vec<Vec<u8>>,
-    cfg: &ZmqThreadConfig,
     wakeup_tx: &UnboundedSender<ZmqWakeupKind>,
 ) -> Result<(), anyhow::Error> {
     debug_assert!(!parts.is_empty());
@@ -166,14 +177,15 @@ fn handle_multipart(
         topic_frame_len = first.len(),
         payload_len,
         multipart_frames = parts.len(),
-        "ZMQ multipart received (topics/payload lengths only; bodies not inspected for template assembly)"
+        "ZMQ multipart received (topic frame length only — bodies never parsed for templates)"
     );
 
-    match classify_topic(first, cfg) {
+    match classify_zmq_topic(first) {
         Some(k) => {
             if wakeup_tx.send(k).is_err() {
                 error!(
                     event = "zmq_error",
+                    polling_fallback_active = true,
                     "ZMQ wakeup channel closed; stopping subscriber forwarding"
                 );
                 return Err(anyhow::anyhow!("wakeup_tx closed"));
@@ -182,7 +194,7 @@ fn handle_multipart(
         None => trace!(
             event = "zmq_message_received",
             topic = topic_enc,
-            "Frame topic not mapped to wakeup (subscription prefix may still accept other publishers)"
+            "Frame topic not mapped to wakeup (unexpected publisher framing)"
         ),
     }
 
@@ -194,7 +206,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_zmq_prioritizes_hashblock_over_sequence() {
+    fn merge_zmq_prioritizes_hashblock_over_other_topics() {
         assert_eq!(
             merge_zmq_pending(Some(ZmqWakeupKind::Sequence), ZmqWakeupKind::Hashblock),
             ZmqWakeupKind::Hashblock
@@ -204,8 +216,38 @@ mod tests {
             ZmqWakeupKind::Hashblock
         );
         assert_eq!(
-            merge_zmq_pending(None, ZmqWakeupKind::Sequence),
+            merge_zmq_pending(Some(ZmqWakeupKind::Rawtx), ZmqWakeupKind::Hashblock),
+            ZmqWakeupKind::Hashblock
+        );
+        assert_eq!(
+            merge_zmq_pending(Some(ZmqWakeupKind::Hashblock), ZmqWakeupKind::Rawtx),
+            ZmqWakeupKind::Hashblock
+        );
+    }
+
+    #[test]
+    fn merge_non_hashblock_last_topic_wins() {
+        assert_eq!(
+            merge_zmq_pending(Some(ZmqWakeupKind::Rawtx), ZmqWakeupKind::Sequence),
             ZmqWakeupKind::Sequence
         );
+        assert_eq!(
+            merge_zmq_pending(Some(ZmqWakeupKind::Sequence), ZmqWakeupKind::Rawtx),
+            ZmqWakeupKind::Rawtx
+        );
+    }
+
+    #[test]
+    fn classify_topics() {
+        assert_eq!(classify_zmq_topic(b"rawtx"), Some(ZmqWakeupKind::Rawtx));
+        assert_eq!(
+            classify_zmq_topic(b"hashblock"),
+            Some(ZmqWakeupKind::Hashblock)
+        );
+        assert_eq!(
+            classify_zmq_topic(b"sequence"),
+            Some(ZmqWakeupKind::Sequence)
+        );
+        assert_eq!(classify_zmq_topic(b"other"), None);
     }
 }
