@@ -30,6 +30,16 @@ poll_interval_ms = 1000
 # AZCoin Core ZMQ (wakeups only — authoritative templates always from RPC)
 # ----------------------------------------------------------------------------
 #
+# Naming: azcoin.conf uses **zmqpub*** (PUB binds); this file uses **zmq_endpoint_***
+# (SUB connect URLs). Each pair must reference the same topic endpoint:
+#   zmqpubrawtx      ↔ zmq_endpoint_rawtx
+#   zmqpubhashblock  ↔ zmq_endpoint_hashblock
+#   zmqpubsequence   ↔ zmq_endpoint_sequence
+#
+# Config validation requires **all three zmq_endpoint_* values non-empty** (see
+# Config::validate in src/config.rs). The subscriber connects to each URL and
+# subscribes to rawtx, hashblock, sequence (see src/zmq_wakeup.rs).
+#
 # Templar subscribes to **rawtx**, **hashblock**, and **sequence** on these
 # connect URLs (multipart payloads are never parsed into templates).
 #
