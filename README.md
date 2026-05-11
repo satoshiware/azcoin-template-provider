@@ -6,7 +6,7 @@
 
 **Super-node operators:** step-by-step checks, systemd/journal workflows, installs, rollback, and failure triage → [docs/template-provider-runbook.md](docs/template-provider-runbook.md).
 
----
+**Program status & testing (leadership):** [docs/template-provider-status-report.md](docs/template-provider-status-report.md) — scope, verification, release checklist, wishlist.
 
 ## Goal
 
