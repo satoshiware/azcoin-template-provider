@@ -1,53 +1,86 @@
 # ============================================================================
-# templar configuration (azcoin SV2 Template Provider)
+# azcoin SV2 Template Provider — example configuration
 # ============================================================================
 #
-# Copy this file to azcoin-template-provider.toml and adjust for your setup:
-#
-#   cp config/azcoin-template-provider.toml.example \
-#      config/azcoin-template-provider.toml
+# Copy and edit for your deployment:
+#   cp config/azcoin-template-provider.toml.example config/azcoin-template-provider.toml
 #
 # ----------------------------------------------------------------------------
-# Legacy keys (ignored)
+# Runtime / CLI (not TOML keys)
 # ----------------------------------------------------------------------------
 #
-# Older files may contain `network`, `template_rules`, `zmq_enabled`,
-# `zmq_endpoint`, `zmq_subscribe_hashblock`, or `zmq_subscribe_sequence`.
-# Serde drops unknown/extra keys; ZMQ wakeup is **always** enabled using the three
-# `zmq_endpoint_*` values below (`poll_interval_ms` remains the perpetual backup).
+# Configuration path:
+#   --config <path>   or   -c <path>          (default: config/azcoin-template-provider.toml)
+#
+# One-shot RPC + chain check, then exit (no poller, SV2 listener, or ZMQ thread):
+#   --health-check
+#
+# Log filter (stderr/stdout/journal, and log_file when set):
+#   RUST_LOG=info
+#   RUST_LOG=azcoin_template_provider=debug,info
+#
+# ------------------------------------------------------------------------------
+# Compiled / non-TOML behavior (see src/config.rs, src/main.rs, src/tp_server.rs)
+# ------------------------------------------------------------------------------
+#
+# - Expected chain:  getblockchaininfo.chain must be "main" at startup (health + steady state).
+# - getblocktemplate: rules are hardcoded to ["segwit"] in the binary (not set from this file).
+# - SV2 protocol:   negotiated Template Distribution version 2 only (min = max = 2).
+# - Live template broadcast channel depth: 512 (template updates to SV2 sessions; main.rs).
+#
+# This service is not miner payout or share accounting. Log fields such as
+# coinbase_output_count are SV2/template construction metadata, not payout truth.
+#
+# ----------------------------------------------------------------------------
+# JSON-RPC methods used in normal operation (steady-state main path)
+# ----------------------------------------------------------------------------
+#
+#   getblockchaininfo   — startup / --health-check chain validation
+#   getblocktemplate    — authoritative block templates (after every poll or ZMQ wakeup)
+#   submitblock         — full block submission after SubmitSolution from the pool
+#
+# Optional RPC helpers exist in src/rpc.rs but are not called from main today:
+#   getbestblockhash    — (not "getbesthash"; correct Bitcoin/AZCoin Core name)
+#   getblockheader      — diagnostics
+#
+# ----------------------------------------------------------------------------
+# AZCoin Core ZMQ publisher options (azcoin.conf) vs this file
+# ----------------------------------------------------------------------------
+#
+# Core PUB binds (examples; ports must match your site):
+#   zmqpubrawtx=...
+#   zmqpubhashblock=...
+#   zmqpubsequence=...
+#
+# Template Provider SUB connect URLs (TOML) — all three must be non-empty at load:
+#   zmq_endpoint_rawtx
+#   zmq_endpoint_hashblock
+#   zmq_endpoint_sequence
+#
+# Topics subscribed: rawtx, hashblock, sequence (wakeup hints only; GBT is authoritative).
+#
+# ----------------------------------------------------------------------------
+# Legacy TOML keys (ignored if present)
+# ----------------------------------------------------------------------------
+#
+# network, template_rules, zmq_enabled, zmq_endpoint, zmq_subscribe_*
+# ZMQ wakeup is always configured via the three zmq_endpoint_* keys; poll_interval_ms is
+# the perpetual slower fallback.
 
 # ----------------------------------------------------------------------------
-# RPC connection (required operational methods — see README / runbook whitelist)
+# RPC connection — use placeholders; match azcoind -rpcuser / -rpcpassword or rpcauth
 # ----------------------------------------------------------------------------
 
 rpc_url = "http://127.0.0.1:19332"
-rpc_user = "azcoin"
-rpc_password = "azcoin"
+rpc_user = "REPLACE_RPC_USER"
+rpc_password = "REPLACE_RPC_PASSWORD"
 
+# Milliseconds between getblocktemplate polls (minimum 100). Slower backup if ZMQ is down.
 poll_interval_ms = 1000
 
 # ----------------------------------------------------------------------------
-# AZCoin Core ZMQ (wakeups only — authoritative templates always from RPC)
+# ZMQ subscriber connect URLs (match Core zmqpub* binds — see header)
 # ----------------------------------------------------------------------------
-#
-# Naming: azcoin.conf uses **zmqpub*** (PUB binds); this file uses **zmq_endpoint_***
-# (SUB connect URLs). Each pair must reference the same topic endpoint:
-#   zmqpubrawtx      ↔ zmq_endpoint_rawtx
-#   zmqpubhashblock  ↔ zmq_endpoint_hashblock
-#   zmqpubsequence   ↔ zmq_endpoint_sequence
-#
-# Config validation requires **all three zmq_endpoint_* values non-empty** (see
-# Config::validate in src/config.rs). The subscriber connects to each URL and
-# subscribes to rawtx, hashblock, sequence (see src/zmq_wakeup.rs).
-#
-# Templar subscribes to **rawtx**, **hashblock**, and **sequence** on these
-# connect URLs (multipart payloads are never parsed into templates).
-#
-# Match AZCoin Core publish binds, for example:
-#
-#   zmqpubrawtx=tcp://127.0.0.1:29333
-#   zmqpubhashblock=tcp://127.0.0.1:29334
-#   zmqpubsequence=tcp://127.0.0.1:29335
 
 zmq_endpoint_rawtx     = "tcp://127.0.0.1:29333"
 zmq_endpoint_hashblock = "tcp://127.0.0.1:29334"
@@ -58,35 +91,32 @@ zmq_reconnect_backoff_ms = 1000
 zmq_wakeup_debounce_ms = 250
 
 # ----------------------------------------------------------------------------
-# Mempool-driven template broadcasts (GBT remains authoritative every refresh)
+# Mempool-driven SV2 template pushes (GBT remains authoritative every refresh)
 # ----------------------------------------------------------------------------
 
-# Absolute fee delta vs the last broadcast template at the **same chain tip**
-# required before broadcasting a mempool-only template update (satoshis).
+# Absolute fee delta vs last broadcast template at the same chain tip before a
+# mempool-only update is pushed (ZATS; not a percentage).
 fee_threshold = 5000
 
-# Upper bound on getblocktemplate non-coinbase transaction count for
-# mempool-only pushes that cleared `fee_threshold`. **Tip-change (new prevhash /
-# height) templates always broadcast and ignore this limit.**
+# Max non-coinbase GBT transaction count for fee-threshold-qualified mempool-only pushes.
+# Tip-change templates ignore this cap.
 max_template_transactions = 5000
 
 # ----------------------------------------------------------------------------
 # SV2 Template Distribution (Noise)
 # ----------------------------------------------------------------------------
 
+# Listen address for pool_sv2 / sv2-apps (external software; may be on another host).
 tp_listen_address = "0.0.0.0:19442"
 
-# !! FOR TESTING / DEVELOPMENT ONLY — well-known keypair (private key = 1).
+# !! FOR TESTING / DEVELOPMENT ONLY — well-known secp256k1 keypair (private key = 1).
+# Replace with a production keypair for real deployments.
 authority_public_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 authority_secret_key = "0000000000000000000000000000000000000000000000000000000000000001"
 
 # ----------------------------------------------------------------------------
 # Logging
 # ----------------------------------------------------------------------------
-#
-# Empty string: stdout/stderr only (same as systemd journal when running under systemd).
-# Non-empty path: append the same structured log stream to this file — the **parent
-# directory must already exist** and be writable by the service user (templar does not
-# create parent directories).
 
-log_file = "/var/log/templar/templar.log"
+# "" = stdout/stderr only. Non-empty = also append to file (parent dir must exist).
+log_file = ""

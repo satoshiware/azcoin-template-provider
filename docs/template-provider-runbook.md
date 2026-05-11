@@ -370,7 +370,7 @@ zmqpubhashblock=tcp://127.0.0.1:29334
 zmqpubsequence=tcp://127.0.0.1:29335
 ```
 
-**Template Provider TOML** (`config/azcoin-template-provider.toml.example`): set `zmq_endpoint_rawtx`, `zmq_endpoint_hashblock`, `zmq_endpoint_sequence`, plus `fee_threshold`, `max_template_transactions`, timeouts/debounce, and optional **`log_file`** (**parent directory must pre-exist**, writable only by the service user).
+**Template Provider TOML** (`config/azcoin-template-provider.toml.example` — see its **header comments** for CLI flags, RPC/ZMQ reference, and compiled constants): set `zmq_endpoint_rawtx`, `zmq_endpoint_hashblock`, `zmq_endpoint_sequence`, plus `fee_threshold`, `max_template_transactions`, timeouts/debounce, and optional **`log_file`** (**parent directory must pre-exist**, writable only by the service user).
 
 Legacy **`zmq_enabled`** / **`zmq_endpoint`** / per-topic booleans **do not change today's wiring** — they are ignored if present — ZMQ wakeup is unconditional.
 
