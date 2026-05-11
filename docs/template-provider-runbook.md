@@ -1,6 +1,42 @@
 # AZCoin Template Provider — operational runbook
 
-Linux-oriented procedures for the **super-node** Template Provider deployment. This document is **reference only** for operators; it does not configure your host.
+Linux-oriented procedures for operators. This document is **reference only**; it does not configure your host.
+
+Most path-based commands below assume **Profile A (super-node layout)**. For **Profile B** (standalone / CEO-style installer paths), substitute the binary, config, and service user from [Deployment profiles](#deployment-profiles).
+
+---
+
+## Deployment profiles
+
+### Profile A — Super-node (default for current live fleet)
+
+| Item | Typical value |
+|------|----------------|
+| systemd unit | `azcoin-template-provider.service` |
+| Binary | `/opt/azcoin-super/templar/bin/azcoin-template-provider` |
+| Config | `/etc/azcoin-super/templar/azcoin-template-provider.toml` |
+| User / group | `azcoin-templar` / `azcoin-templar` |
+| Working / state dir | `/var/lib/azcoin-super/templar` |
+
+**Stay on Profile A** unless you plan and test a deliberate migration (paths, user, systemd, automation).
+
+### Profile B — Standalone / CEO installer (alternative)
+
+| Item | Typical value |
+|------|----------------|
+| Binary | `/usr/local/bin/azcoin-template-provider` |
+| Config | `/etc/templar/azcoin-template-provider.toml` |
+| User / group | `templar` / `templar` |
+| Runtime / logs | `/var/lib/templar`, `/var/log/templar` |
+
+### External pool (`pool_sv2` / sv2-apps)
+
+**pool_sv2** is **external software**; it can run **on another machine** than the Template Provider. Use routable **`tp_listen_address`**, firewall rules, and the pool’s SV2 Template Provider peer settings accordingly. This service does **not** implement miner payouts or ledger truth.
+
+### ZMQ naming (Core vs Template Provider)
+
+- **`azcoin.conf`:** `zmqpubrawtx`, `zmqpubhashblock`, `zmqpubsequence` (PUB binds).
+- **Template Provider TOML:** `zmq_endpoint_rawtx`, `zmq_endpoint_hashblock`, `zmq_endpoint_sequence` (SUB connect URLs; **all three must be non-empty** at config load — `src/config.rs`). The process **subscribes** to topics **`rawtx`**, **`hashblock`**, and **`sequence`** (`src/zmq_wakeup.rs`).
 
 ---
 
@@ -35,7 +71,9 @@ Operators own payout logic, wallet policy, and pool configuration elsewhere.
 
 ---
 
-## 3. Key paths and service names
+## 3. Key paths and service names (Profile A)
+
+The table below lists **Profile A** (super-node). For **Profile B** paths, see [Deployment profiles](#deployment-profiles).
 
 | Item | Path or name |
 |------|----------------|
@@ -46,7 +84,7 @@ Operators own payout logic, wallet policy, and pool configuration elsewhere.
 | Runtime state (typical layout) | `/var/lib/azcoin-super/templar` |
 | Logs (stdout/journal plus optional **`log_file`**) | site-specific (`log_file` path must exist) |
 | Related: AZCoin Core | `azcoind.service` |
-| Related: SV2 pool | `pool-sv2.service` |
+| Related: SV2 pool | `pool-sv2.service` (may be remote; external to this repo) |
 
 **Source/build workspace** (developer checkout) is separate from these paths unless you deliberately install into `/opt`.
 
@@ -347,8 +385,6 @@ sudo journalctl -u azcoin-template-provider.service -n 320 --no-pager -l \
   | grep -E 'event="zmq_(subscriber_starting|subscriber_ready)"|event="template_refresh_trigger"' \
   || true
 ```
-
-Tune **`poll_interval_ms` slower when ZMQ is healthy** — ZMQ absorbs bursty mempool/tip chatter; **`event=template_refresh_trigger`** emits at **`DEBUG`** verbosity with `reason` ∈ {`poll`, `zmq_hashblock`, `zmq_sequence`} (raise `RUST_LOG` when diagnosing).
 
 ---
 

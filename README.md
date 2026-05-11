@@ -73,18 +73,47 @@ translator / miners
 
 ---
 
-## Deployment model (source vs live super-node layout)
+## Deployment profiles
 
-Development and builds happen in this repository only. Typical **live** installs on an AZCoin super-node host use:
+Development and builds happen in this repository only. Two on-disk layouts appear in the field; use **one** per host unless you are deliberately migrating.
 
-| Concept | Production path |
+### Profile A — Super-node layout (current live fleet)
+
+| Concept | Typical path |
 |--------|-------------------|
 | Installed Template Provider binary | `/opt/azcoin-super/templar/bin/azcoin-template-provider` |
 | Installed config | `/etc/azcoin-super/templar/azcoin-template-provider.toml` |
 | systemd unit | `azcoin-template-provider.service` |
-| Service user | `azcoin-templar` |
+| Service user / group | `azcoin-templar` / `azcoin-templar` |
+| Working directory / state | `/var/lib/azcoin-super/templar` |
 
-The Template Provider stays **co-resident** with the local SV2 pool for the MVP (`127.0.0.1` or LAN). Configuration should use configurable listen/bind addresses (`tp_listen_address`, pool upstream) rather than assuming the pool will always be local.
+**Operational default:** production super-nodes already on Profile A should **stay on Profile A** until a deliberate, tested migration (paths, user, unit, automation).
+
+### Profile B — Standalone / CEO installer layout (alternative)
+
+| Concept | Typical path |
+|--------|-------------------|
+| Installed binary | `/usr/local/bin/azcoin-template-provider` |
+| Config | `/etc/templar/azcoin-template-provider.toml` |
+| Service user / group | `templar` / `templar` |
+| Runtime / log dirs (typical) | `/var/lib/templar`, `/var/log/templar` |
+
+Treat Profile B as **installer-specific** until your organisation’s packages and acceptance checks match it end-to-end.
+
+### External `pool_sv2` / sv2-apps
+
+**pool_sv2** (sv2-apps) is **external** to this repository. The pool connects inbound to **`tp_listen_address`** over the network; it **may run on a different host** than the Template Provider. This service is **not** payout or accounting authority — do not treat **`coinbase_output_count`** in logs as miner payout truth (it is SV2 placeholder / construction metadata).
+
+### ZMQ naming contract
+
+| Side | Role | Keys |
+|------|------|------|
+| **AZCoin Core** (`azcoin.conf`) | PUB **bind** options | `zmqpubrawtx=…`, `zmqpubhashblock=…`, `zmqpubsequence=…` |
+| **Template Provider** (TOML) | SUB **connect** URLs | `zmq_endpoint_rawtx`, `zmq_endpoint_hashblock`, `zmq_endpoint_sequence` |
+
+### Alignment with this release (`config` + ZMQ subscriber)
+
+Startup **rejects empty** any of the three `zmq_endpoint_*` strings (`Config::validate` in **`src/config.rs`**). The background subscriber then **connects to all three** URLs and **subscribes** to topics **`rawtx`**, **`hashblock`**, and **`sequence`** (`src/zmq_wakeup.rs`). Configure **AZCoin Core** with **`zmqpubrawtx`**, **`zmqpubhashblock`**, and **`zmqpubsequence`** on bind URLs that match those connect targets (ports are site-specific).
 
 **This README does not configure `/opt`, `/etc`, or systemd.** Copy artifacts from your CI or release build outputs.
 
@@ -119,7 +148,7 @@ sudo journalctl -u azcoin-template-provider.service -n 240 --no-pager \
 
 ### Safe manual install / update (run on the deployment host — not from CI)
 
-Adjust paths only if your site uses different layout.
+The commands below assume **Profile A** paths. For **Profile B**, substitute binary, config, and ownership paths from [Deployment profiles](#deployment-profiles). Adjust further only if your site uses a different layout.
 
 ```bash
 # Build (on a builder or checkout)
@@ -284,7 +313,7 @@ Framing note: outbound Template Distribution uses **`extension_type == 0`** and 
 
 ## Configuration
 
-Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. ZMQ endpoint addresses and push policy knobs are configurable (see **`config/azcoin-template-provider.toml.example`**).
+Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. ZMQ endpoint addresses and push policy knobs are configurable (see **`config/azcoin-template-provider.toml.example`**). **Install paths on disk** follow **Profile A** or **Profile B** (see [Deployment profiles](#deployment-profiles)); the **same TOML field names** apply to both.
 
 ### JSON-RPC whitelist (AZCoin Core `rpcwhitelist` reference)
 
@@ -309,9 +338,11 @@ Optional / internal-only helpers (**defined in [`src/rpc.rs`](src/rpc.rs)** but 
 | `rpc_user` | string | yes | — | RPC username |
 | `rpc_password` | string | yes | — | RPC password |
 | `poll_interval_ms` | integer | yes | — | Poll interval in ms (minimum 100; perpetual ZMQ-loss fallback) |
-| `zmq_endpoint_rawtx` | string | no | `tcp://127.0.0.1:29333` | SUB connect URL for **`rawtx`** Publisher |
-| `zmq_endpoint_hashblock` | string | no | `tcp://127.0.0.1:29334` | SUB connect URL for **`hashblock`** Publisher |
-| `zmq_endpoint_sequence` | string | no | `tcp://127.0.0.1:29335` | SUB connect URL for **`sequence`** Publisher |
+| `zmq_endpoint_rawtx` | string | yes¹ | `tcp://127.0.0.1:29333` | SUB connect URL for **`rawtx`** (must be non-empty at load) |
+| `zmq_endpoint_hashblock` | string | yes¹ | `tcp://127.0.0.1:29334` | SUB connect URL for **`hashblock`** (must be non-empty at load) |
+| `zmq_endpoint_sequence` | string | yes¹ | `tcp://127.0.0.1:29335` | SUB connect URL for **`sequence`** (must be non-empty at load) |
+
+¹ serde defaults apply, but **`Config::load` validation** rejects whitespace-only / empty values for all three.
 | `fee_threshold` | integer | no | `5000` | Min satoshi **fee-sum increase** vs last pushed template **at same tip** to SV2-push a mempool-only update |
 | `max_template_transactions` | integer | no | `5000` | Caps non-coinbase tx count on **fee-threshold-qualified** mempool-only pushes (**ignored on chain-tip rollover**) |
 | `log_file` | string | no | `""` | Append structured logs here as well as stdout; empty disables file sink |
