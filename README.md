@@ -6,7 +6,11 @@
 
 **Super-node operators:** step-by-step checks, systemd/journal workflows, installs, rollback, and failure triage → [docs/template-provider-runbook.md](docs/template-provider-runbook.md).
 
-**Program status & testing (leadership):** [docs/template-provider-status-report.md](docs/template-provider-status-report.md) — scope, verification, release checklist, wishlist.
+**Program status & testing (leadership):** [docs/template-provider-status-report.md](docs/template-provider-status-report.md) — scope, live verification, wishlist.
+
+**Release checklist & dry-run:** [docs/template-provider-release-checklist.md](docs/template-provider-release-checklist.md) — build, package, Profile A install, rollback, GitHub steps, optional `sc-node/azpool/templar` copy experiment.
+
+---
 
 ## Goal
 
