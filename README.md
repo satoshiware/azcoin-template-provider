@@ -73,18 +73,53 @@ translator / miners
 
 ---
 
-## Deployment model (source vs live super-node layout)
+## Deployment profiles
 
-Development and builds happen in this repository only. Typical **live** installs on an AZCoin super-node host use:
+Development and builds happen in this repository only. Two filesystem layouts are in use across AZCOIN deployments; pick **one** per host and migrate only with a deliberate plan.
 
-| Concept | Production path |
+### Profile A — Super-node layout (current supported live deployment)
+
+Typical **super-node** hosts use this layout today:
+
+| Concept | Typical path |
 |--------|-------------------|
 | Installed Template Provider binary | `/opt/azcoin-super/templar/bin/azcoin-template-provider` |
 | Installed config | `/etc/azcoin-super/templar/azcoin-template-provider.toml` |
 | systemd unit | `azcoin-template-provider.service` |
-| Service user | `azcoin-templar` |
+| Service user / group | `azcoin-templar` / `azcoin-templar` |
+| Working directory / state (typical) | `/var/lib/azcoin-super/templar` |
 
-The Template Provider stays **co-resident** with the local SV2 pool for the MVP (`127.0.0.1` or LAN). Configuration should use configurable listen/bind addresses (`tp_listen_address`, pool upstream) rather than assuming the pool will always be local.
+**Fleet default:** production super-nodes already on this model should **remain on Profile A** unless you plan an intentional migration (paths, user, unit, automation).
+
+### Profile B — Standalone / CEO installer layout (installer-driven alternative)
+
+Some installers place artifacts like:
+
+| Concept | Typical path |
+|--------|-------------------|
+| Installed binary | `/usr/local/bin/azcoin-template-provider` |
+| Config | `/etc/templar/azcoin-template-provider.toml` |
+| Service user / group | `templar` / `templar` |
+| Runtime / log dirs (typical) | `/var/lib/templar`, `/var/log/templar` |
+
+Treat Profile B as **documentation of an alternative** until your organisation’s CEO installer and acceptance checks match it end-to-end.
+
+### External `pool_sv2`
+
+[`pool_sv2`](https://github.com/stratum-mining) / **sv2-apps** pool software is **external** to this repository. The Template Provider speaks SV2 Template Distribution over **`tp_listen_address`**; **the pool may run on another host** (route/firewall/timeouts and the pool’s upstream `Sv2Tp` settings must reach that listener). This service is **not** a payout or accounting authority. Do not treat `coinbase_output_count` (or similar log fields) as miner payout truth — they describe SV2 template construction metadata.
+
+### ZMQ naming contract
+
+| Side | Role | Example keys / values |
+|------|------|------------------------|
+| **AZCoin Core** (`azcoin.conf`) | PUBLISHER **bind** options | `zmqpubrawtx=…`, `zmqpubhashblock=…`, `zmqpubsequence=…` |
+| **Template Provider** (TOML) | SUBSCRIBER **connect** URLs | `zmq_endpoint_rawtx`, `zmq_endpoint_hashblock`, `zmq_endpoint_sequence` |
+
+Ports and hosts must line up: each **`zmq_endpoint_*`** should connect to the Core publisher that serves the matching topic (`rawtx` ↔ `zmqpubrawtx`, etc.).
+
+### Release note — three ZMQ endpoints
+
+This **0.2.x** release expects **three non-empty** `zmq_endpoint_*` values in TOML and matching **`zmqpubrawtx`**, **`zmqpubhashblock`**, and **`zmqpubsequence`** on the node. Some planning notes mention only **hashblock** and **sequence**; **that two-channel-only layout is not supported by the current binary** without a follow-up code change (e.g. optional `rawtx`). Until then, enable all three publishers or do not deploy a build that omits them.
 
 **This README does not configure `/opt`, `/etc`, or systemd.** Copy artifacts from your CI or release build outputs.
 
@@ -119,7 +154,7 @@ sudo journalctl -u azcoin-template-provider.service -n 240 --no-pager \
 
 ### Safe manual install / update (run on the deployment host — not from CI)
 
-Adjust paths only if your site uses different layout.
+The commands below use **Profile A** install paths. For **Profile B** (standalone / CEO-style layout), substitute the binary, config, and ownership paths from [Deployment profiles](#deployment-profiles). Adjust paths only if your site uses a different layout.
 
 ```bash
 # Build (on a builder or checkout)
@@ -284,7 +319,7 @@ Framing note: outbound Template Distribution uses **`extension_type == 0`** and 
 
 ## Configuration
 
-Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. ZMQ endpoint addresses and push policy knobs are configurable (see **`config/azcoin-template-provider.toml.example`**).
+Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. ZMQ endpoint addresses and push policy knobs are configurable (see **`config/azcoin-template-provider.toml.example`**). **On-disk install locations** depend on whether you deploy **Profile A** or **Profile B** (see [Deployment profiles](#deployment-profiles)); the **same TOML field names** apply to both.
 
 ### JSON-RPC whitelist (AZCoin Core `rpcwhitelist` reference)
 

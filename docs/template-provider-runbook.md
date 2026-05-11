@@ -1,6 +1,44 @@
 # AZCoin Template Provider — operational runbook
 
-Linux-oriented procedures for the **super-node** Template Provider deployment. This document is **reference only** for operators; it does not configure your host.
+Linux-oriented procedures for operators. This document is **reference only**; it does not configure your host.
+
+This runbook’s concrete paths and commands assume **Profile A (super-node layout)** unless stated otherwise. An alternative **Profile B (standalone / CEO-style installer)** layout is summarized below for parity with installer drafts.
+
+---
+
+## Deployment profiles
+
+### Profile A — Super-node (default for current live fleet)
+
+| Item | Typical value |
+|------|----------------|
+| systemd unit | `azcoin-template-provider.service` |
+| Binary | `/opt/azcoin-super/templar/bin/azcoin-template-provider` |
+| Config | `/etc/azcoin-super/templar/azcoin-template-provider.toml` |
+| User / group | `azcoin-templar` / `azcoin-templar` |
+| Working / state dir | `/var/lib/azcoin-super/templar` |
+
+**Operational default:** super-node hosts already deployed this way should **stay on Profile A** until a deliberate migration is planned and tested.
+
+### Profile B — Standalone / CEO installer (alternative)
+
+| Item | Typical value |
+|------|----------------|
+| Binary | `/usr/local/bin/azcoin-template-provider` |
+| Config | `/etc/templar/azcoin-template-provider.toml` |
+| User / group | `templar` / `templar` |
+| Runtime / logs | `/var/lib/templar`, `/var/log/templar` |
+
+### External pool (`pool_sv2`)
+
+**sv2-apps / `pool_sv2` is external software** to this repo. The Template Provider listens on **`tp_listen_address`**; the **pool may run on a different machine** — use routable addresses, firewall rules, and pool config (`Sv2Tp` peer) accordingly. The Template Provider does **not** implement miner payout ledgers or accounting truth.
+
+### ZMQ naming (Core vs Template Provider)
+
+- **AZCoin Core** (`azcoin.conf`): **publisher** options **`zmqpubrawtx`**, **`zmqpubhashblock`**, **`zmqpubsequence`** (each is a PUB bind URL).
+- **Template Provider** (TOML): **subscriber** connect URLs **`zmq_endpoint_rawtx`**, **`zmq_endpoint_hashblock`**, **`zmq_endpoint_sequence`**.
+
+**Release expectation:** the current binary requires **all three** `zmq_endpoint_*` values non-empty and three matching Core publishers, unless a future release makes **`rawtx`** optional. Installer drafts that enable only **hashblock** and **sequence** are **not** sufficient for this release without a follow-up product/code change.
 
 ---
 
@@ -35,7 +73,9 @@ Operators own payout logic, wallet policy, and pool configuration elsewhere.
 
 ---
 
-## 3. Key paths and service names
+## 3. Key paths and service names (Profile A — super-node)
+
+The table below matches **Profile A**. For **Profile B** paths, see [Deployment profiles](#deployment-profiles).
 
 | Item | Path or name |
 |------|----------------|
@@ -46,7 +86,7 @@ Operators own payout logic, wallet policy, and pool configuration elsewhere.
 | Runtime state (typical layout) | `/var/lib/azcoin-super/templar` |
 | Logs (stdout/journal plus optional **`log_file`**) | site-specific (`log_file` path must exist) |
 | Related: AZCoin Core | `azcoind.service` |
-| Related: SV2 pool | `pool-sv2.service` |
+| Related: SV2 pool | `pool-sv2.service` (may be remote; external to this repo) |
 
 **Source/build workspace** (developer checkout) is separate from these paths unless you deliberately install into `/opt`.
 

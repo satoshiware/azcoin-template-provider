@@ -30,14 +30,29 @@ poll_interval_ms = 1000
 # AZCoin Core ZMQ (wakeups only — authoritative templates always from RPC)
 # ----------------------------------------------------------------------------
 #
+# Naming contract:
+#   - azcoin.conf: PUBLISHER binds → zmqpubrawtx / zmqpubhashblock / zmqpubsequence
+#   - This file:   SUB connect URLs → zmq_endpoint_rawtx / zmq_endpoint_hashblock /
+#                   zmq_endpoint_sequence (must match the Core topics above).
+#
+# This release requires all three zmq_endpoint_* values (non-empty). Plans that
+# enable only zmqpubhashblock + zmqpubsequence need a follow-up code change to make
+# rawtx optional — not supported by the current binary alone.
+#
 # Templar subscribes to **rawtx**, **hashblock**, and **sequence** on these
 # connect URLs (multipart payloads are never parsed into templates).
 #
-# Match AZCoin Core publish binds, for example:
+# Match AZCoin Core publish binds **exactly** — ports are site-specific. Examples:
 #
 #   zmqpubrawtx=tcp://127.0.0.1:29333
 #   zmqpubhashblock=tcp://127.0.0.1:29334
 #   zmqpubsequence=tcp://127.0.0.1:29335
+#
+# Another layout (e.g. some super-node hosts):
+#
+#   zmqpubhashblock=tcp://127.0.0.1:29332
+#   zmqpubrawtx=tcp://127.0.0.1:29335
+#   zmqpubsequence=tcp://127.0.0.1:29336
 
 zmq_endpoint_rawtx     = "tcp://127.0.0.1:29333"
 zmq_endpoint_hashblock = "tcp://127.0.0.1:29334"
