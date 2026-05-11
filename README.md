@@ -313,7 +313,7 @@ Framing note: outbound Template Distribution uses **`extension_type == 0`** and 
 
 ## Configuration
 
-Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. ZMQ endpoint addresses and push policy knobs are configurable (see **`config/azcoin-template-provider.toml.example`**). **Install paths on disk** follow **Profile A** or **Profile B** (see [Deployment profiles](#deployment-profiles)); the **same TOML field names** apply to both.
+Expected AZCOIN chain validation and `getblocktemplate` rules (`["segwit"]`) are **compiled into the binary** for production — they are not TOML settings. ZMQ endpoint addresses and push policy knobs are configurable (see **`config/azcoin-template-provider.toml.example`**, including **CLI flags**, **RPC/ZMQ naming**, and **non-config constants** in the file header comments). **Install paths on disk** follow **Profile A** or **Profile B** (see [Deployment profiles](#deployment-profiles)); the **same TOML field names** apply to both.
 
 ### JSON-RPC whitelist (AZCoin Core `rpcwhitelist` reference)
 
