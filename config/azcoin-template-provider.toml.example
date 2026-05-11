@@ -1,5 +1,5 @@
 # ============================================================================
-# azcoin-template-provider configuration
+# templar configuration (azcoin SV2 Template Provider)
 # ============================================================================
 #
 # Copy this file to azcoin-template-provider.toml and adjust for your setup:
@@ -7,88 +7,76 @@
 #   cp config/azcoin-template-provider.toml.example \
 #      config/azcoin-template-provider.toml
 #
-# The service reads this file at startup (override with --config <path>).
+# ----------------------------------------------------------------------------
+# Legacy keys (ignored)
+# ----------------------------------------------------------------------------
 #
-# See README.md for the 0.2.0 stable operational baseline (SV2 live templates + SubmitSolution).
+# Older files may contain `network`, `template_rules`, `zmq_enabled`,
+# `zmq_endpoint`, `zmq_subscribe_hashblock`, or `zmq_subscribe_sequence`.
+# Serde drops unknown/extra keys; ZMQ wakeup is **always** enabled using the three
+# `zmq_endpoint_*` values below (`poll_interval_ms` remains the perpetual backup).
 
 # ----------------------------------------------------------------------------
-# RPC connection
+# RPC connection (required operational methods — see README / runbook whitelist)
 # ----------------------------------------------------------------------------
 
-# JSON-RPC endpoint of azcoind (include http:// or https://).
-# Default ports by network:
-#   mainnet  — 8332
-#   testnet  — 18332
-#   regtest  — 18443
-rpc_url = "http://127.0.0.1:8332"
-
-# RPC credentials (must match azcoind's -rpcuser / -rpcpassword or the
-# values in azcoin.conf).
+rpc_url = "http://127.0.0.1:19332"
 rpc_user = "azcoin"
 rpc_password = "azcoin"
 
-# ----------------------------------------------------------------------------
-# Polling
-# ----------------------------------------------------------------------------
-
-# How often to poll getblocktemplate, in milliseconds (minimum 100).
-# Lower values detect new blocks faster but increase RPC load on the node.
 poll_interval_ms = 1000
 
 # ----------------------------------------------------------------------------
-# AZCoin Core ZMQ (optional — wakeup / interrupt only)
+# AZCoin Core ZMQ (wakeups only — authoritative templates always from RPC)
 # ----------------------------------------------------------------------------
 #
-# When zmq_enabled = true the service subscribes to Bitcoin-style topics
-# (hashblock, sequence) published by AZCoin Core. Multipart payloads are treated
-# as hints only — every refresh still pulls an authoritative snapshot via RPC
-# getblocktemplate (submitblock stays JSON-RPC). poll_interval_ms remains the
-# backup cadence when ZMQ disconnects or is quiet.
+# Templar subscribes to **rawtx**, **hashblock**, and **sequence** on these
+# connect URLs (multipart payloads are never parsed into templates).
 #
-# Security: ZeroMQ Publisher/Subscriber transports are typically unauthenticated;
-# bind to loopback / trusted VLAN / WireGuard, not raw public IPs.
+# Match AZCoin Core publish binds, for example:
 #
-zmq_enabled = true
-zmq_endpoint = "tcp://127.0.0.1:29334"
-zmq_subscribe_hashblock = true
-zmq_subscribe_sequence = true
+#   zmqpubrawtx=tcp://127.0.0.1:29333
+#   zmqpubhashblock=tcp://127.0.0.1:29334
+#   zmqpubsequence=tcp://127.0.0.1:29335
+
+zmq_endpoint_rawtx     = "tcp://127.0.0.1:29333"
+zmq_endpoint_hashblock = "tcp://127.0.0.1:29334"
+zmq_endpoint_sequence  = "tcp://127.0.0.1:29335"
+
 zmq_receive_timeout_ms = 1000
 zmq_reconnect_backoff_ms = 1000
 zmq_wakeup_debounce_ms = 250
 
 # ----------------------------------------------------------------------------
-# AZCOIN chain + getblocktemplate rules (built into the binary, not TOML)
-# ----------------------------------------------------------------------------
-#
-# Production validates getblockchaininfo.chain == "main" and always calls
-# getblocktemplate with rules ["segwit"]. Do not add network= or
-# template_rules= here; legacy keys in old files are ignored by serde.
-#
-# ----------------------------------------------------------------------------
-# SV2 Template Provider
+# Mempool-driven template broadcasts (GBT remains authoritative every refresh)
 # ----------------------------------------------------------------------------
 
-# TCP address the SV2 Template Provider (Noise) listener binds to.
-# pool_sv2 connects here to perform the Noise NX handshake.
-tp_listen_address = "0.0.0.0:8442"
+# Absolute fee delta vs the last broadcast template at the **same chain tip**
+# required before broadcasting a mempool-only template update (satoshis).
+fee_threshold = 5000
 
-# Noise protocol authority keypair (hex-encoded, 32 bytes / 64 hex chars).
-#
-# The responder uses this keypair to sign the handshake certificate that
-# proves its identity to the connecting pool.  The pool must be configured
-# with the matching authority_public_key pasted into:
-#   [template_provider_type.Sv2Tp]
-#   public_key = "<authority_public_key>"
-#
-# The pool expects the raw 32-byte secp256k1 x-only public key encoded as hex.
-#
-# !! FOR TESTING / DEVELOPMENT ONLY !!
-# The keys below are the well-known secp256k1 generator-point keypair
-# (private key = 1).  NEVER use them in production.
-#
-# To generate a production keypair you can use the SRI `key-utils` crate
-# or any secp256k1 tool that outputs 32-byte x-only public keys.
-#
-# Leave BOTH empty to disable the Noise listener (poller-only mode).
+# Upper bound on getblocktemplate non-coinbase transaction count for
+# mempool-only pushes that cleared `fee_threshold`. **Tip-change (new prevhash /
+# height) templates always broadcast and ignore this limit.**
+max_template_transactions = 5000
+
+# ----------------------------------------------------------------------------
+# SV2 Template Distribution (Noise)
+# ----------------------------------------------------------------------------
+
+tp_listen_address = "0.0.0.0:19442"
+
+# !! FOR TESTING / DEVELOPMENT ONLY — well-known keypair (private key = 1).
 authority_public_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 authority_secret_key = "0000000000000000000000000000000000000000000000000000000000000001"
+
+# ----------------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------------
+#
+# Empty string: stdout/stderr only (same as systemd journal when running under systemd).
+# Non-empty path: append the same structured log stream to this file — the **parent
+# directory must already exist** and be writable by the service user (templar does not
+# create parent directories).
+
+log_file = "/var/log/templar/templar.log"
